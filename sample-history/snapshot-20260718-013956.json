@@ -1,0 +1,324 @@
+{
+  "GeneratedUtc": "2026-07-18T01:39:56Z",
+  "TenantId": "11111111-2222-3333-4444-555555555555",
+  "Organization": {
+    "DisplayName": "Northwind Traders",
+    "CreatedUtc": "2019-03-14T00:00:00Z",
+    "Domains": [
+      {
+        "Name": "northwind.onmicrosoft.com",
+        "IsDefault": false,
+        "IsInitial": true
+      },
+      {
+        "Name": "northwindtraders.com",
+        "IsDefault": true,
+        "IsInitial": false
+      }
+    ]
+  },
+  "Licenses": [
+    {
+      "Sku": "EMS",
+      "Purchased": 150,
+      "Assigned": 150,
+      "Available": 0
+    },
+    {
+      "Sku": "POWER_BI_STANDARD",
+      "Purchased": 20,
+      "Assigned": 6,
+      "Available": 14
+    },
+    {
+      "Sku": "SPB",
+      "Purchased": 150,
+      "Assigned": 132,
+      "Available": 18
+    }
+  ],
+  "UserCounts": {
+    "Members": 189,
+    "EnabledMembers": 178,
+    "Guests": 20
+  },
+  "ConditionalAccess": {
+    "Policies": [
+      {
+        "Name": "Block legacy authentication",
+        "State": "enabled",
+        "IncludeUsers": [
+          "All"
+        ],
+        "ExcludeUsers": [],
+        "IncludeGroups": [],
+        "ExcludeGroups": [],
+        "IncludeRoles": [],
+        "ExcludeRoles": [],
+        "IncludeApps": [
+          "All cloud apps"
+        ],
+        "ExcludeApps": [],
+        "UserActions": [],
+        "Platforms": {
+          "Include": [
+            null
+          ],
+          "Exclude": [
+            null
+          ]
+        },
+        "Locations": {
+          "Include": [],
+          "Exclude": []
+        },
+        "ClientAppTypes": [
+          "exchangeActiveSync",
+          "other"
+        ],
+        "SignInRisk": [],
+        "UserRisk": [],
+        "GrantOperator": "OR",
+        "GrantControls": [
+          "block"
+        ],
+        "SessionControls": []
+      },
+      {
+        "Name": "Block outside trusted countries",
+        "State": "disabled",
+        "IncludeUsers": [
+          "All"
+        ],
+        "ExcludeUsers": [],
+        "IncludeGroups": [],
+        "ExcludeGroups": [],
+        "IncludeRoles": [],
+        "ExcludeRoles": [],
+        "IncludeApps": [
+          "All cloud apps"
+        ],
+        "ExcludeApps": [],
+        "UserActions": [],
+        "Platforms": {
+          "Include": [
+            null
+          ],
+          "Exclude": [
+            null
+          ]
+        },
+        "Locations": {
+          "Include": [
+            "All"
+          ],
+          "Exclude": [
+            "Trusted countries"
+          ]
+        },
+        "ClientAppTypes": [],
+        "SignInRisk": [],
+        "UserRisk": [],
+        "GrantOperator": "OR",
+        "GrantControls": [
+          "block"
+        ],
+        "SessionControls": []
+      },
+      {
+        "Name": "Require MFA for all users",
+        "State": "enabled",
+        "IncludeUsers": [
+          "All"
+        ],
+        "ExcludeUsers": [
+          "Break Glass"
+        ],
+        "IncludeGroups": [],
+        "ExcludeGroups": [
+          "Service Accounts"
+        ],
+        "IncludeRoles": [],
+        "ExcludeRoles": [],
+        "IncludeApps": [
+          "All cloud apps"
+        ],
+        "ExcludeApps": [],
+        "UserActions": [],
+        "Platforms": {
+          "Include": [
+            null
+          ],
+          "Exclude": [
+            null
+          ]
+        },
+        "Locations": {
+          "Include": [],
+          "Exclude": []
+        },
+        "ClientAppTypes": [],
+        "SignInRisk": [],
+        "UserRisk": [],
+        "GrantOperator": "OR",
+        "GrantControls": [
+          "mfa"
+        ],
+        "SessionControls": []
+      }
+    ],
+    "NamedLocations": [
+      {
+        "Name": "HQ egress",
+        "Kind": "IP ranges",
+        "Detail": "2 range(s), trusted"
+      },
+      {
+        "Name": "Trusted countries",
+        "Kind": "Countries",
+        "Detail": "US, CA"
+      }
+    ]
+  },
+  "Roles": [
+    {
+      "Role": "Exchange Administrator",
+      "Members": [
+        {
+          "DisplayName": "Mail Admin",
+          "UserPrincipalName": "mailadmin@northwindtraders.com",
+          "Type": "user"
+        }
+      ]
+    },
+    {
+      "Role": "Global Administrator",
+      "Members": [
+        {
+          "DisplayName": "Break Glass",
+          "UserPrincipalName": "breakglass@northwindtraders.com",
+          "Type": "user"
+        },
+        {
+          "DisplayName": "Jon Tester",
+          "UserPrincipalName": "jon@northwindtraders.com",
+          "Type": "user"
+        }
+      ]
+    },
+    {
+      "Role": "Helpdesk Administrator",
+      "Members": [
+        {
+          "DisplayName": "Hank Support",
+          "UserPrincipalName": "hank@northwindtraders.com",
+          "Type": "user"
+        },
+        {
+          "DisplayName": "Helpdesk Team",
+          "UserPrincipalName": null,
+          "Type": "group"
+        }
+      ]
+    }
+  ],
+  "Groups": {
+    "Total": 4,
+    "M365": 1,
+    "SecurityOnly": 3,
+    "MailEnabled": 1,
+    "RoleAssignable": [
+      "Helpdesk Team"
+    ],
+    "Dynamic": [
+      {
+        "Name": "Sales - Dynamic",
+        "Rule": "(user.department -eq \"Sales\")",
+        "State": "On"
+      },
+      {
+        "Name": "VIP Devices",
+        "Rule": "(device.deviceOwnership -eq \"Company\")",
+        "State": "Paused"
+      }
+    ]
+  },
+  "AuthMethods": [
+    {
+      "Method": "Fido2",
+      "State": "enabled",
+      "Targets": [
+        "all_users"
+      ]
+    },
+    {
+      "Method": "MicrosoftAuthenticator",
+      "State": "enabled",
+      "Targets": [
+        "all_users"
+      ]
+    },
+    {
+      "Method": "Sms",
+      "State": "disabled",
+      "Targets": []
+    },
+    {
+      "Method": "TemporaryAccessPass",
+      "State": "enabled",
+      "Targets": [
+        "all_users"
+      ]
+    }
+  ],
+  "UserSettings": {
+    "Users can register applications": false,
+    "Users can create security groups": false,
+    "Users can read other users": true,
+    "Who can invite guests": "adminsAndGuestInviters",
+    "Guest user access level": "Restricted access",
+    "Email-verified users can join the tenant": false,
+    "Self-service password reset enabled": true
+  },
+  "Applications": [
+    {
+      "Name": "HR Sync",
+      "AppId": "app-guid-1",
+      "SignInAudience": "AzureADMyOrg",
+      "CreatedUtc": "2024-09-28T01:39:56Z",
+      "Credentials": [
+        {
+          "Type": "Client secret",
+          "Name": "sync secret",
+          "ExpiresUtc": "2026-08-17T01:39:56Z"
+        }
+      ]
+    },
+    {
+      "Name": "Reporting API",
+      "AppId": "app-guid-3",
+      "SignInAudience": "AzureADMyOrg",
+      "CreatedUtc": "2025-11-02T01:39:56Z",
+      "Credentials": [
+        {
+          "Type": "Certificate",
+          "Name": "signing cert",
+          "ExpiresUtc": "2026-11-12T01:39:56Z"
+        }
+      ]
+    },
+    {
+      "Name": "Ticketing Webhook",
+      "AppId": "app-guid-2",
+      "SignInAudience": "AzureADMyOrg",
+      "CreatedUtc": "2025-07-25T01:39:56Z",
+      "Credentials": [
+        {
+          "Type": "Client secret",
+          "Name": "prod",
+          "ExpiresUtc": "2026-09-19T01:39:56Z"
+        }
+      ]
+    }
+  ]
+}
