@@ -29,7 +29,9 @@
       8. Change log - what changed between snapshots, computed by diffing
 
     Each run also archives its snapshot to history/ - from two snapshots
-    onward the report gains trend sparklines and a "what changed" feed.
+    onward the report gains trend sparklines and a "what changed" feed -
+    and writes run-summary.json (this run's delta), which the companion
+    Send-TenantDocsAlert.ps1 turns into Teams/email alerts.
 
     Makes no changes to the tenant. Every call is a read.
 
@@ -1328,9 +1330,34 @@ $data | ConvertTo-Json -Depth 12 | Set-Content -Path (Join-Path $OutputPath 'ten
 Write-Report -Data $data -Path (Join-Path $OutputPath 'report.html') -WarnDays $StaleCredDays `
              -TrendSeries $trend -ChangeLog $changeLog
 
+# run-summary.json: this run's delta + headline numbers, purpose-built for
+# automation (see Send-TenantDocsAlert.ps1) and anything else consuming runs.
+$credRowsNow = @(Get-CredRows $data $StaleCredDays)
+$latest = @($trend)[-1]
+$newChanges = @(@($changeLog) | Where-Object { "$($_.Ts)" -eq "$($data.GeneratedUtc)" })
+[ordered]@{
+    GeneratedUtc  = $data.GeneratedUtc
+    Tenant        = [ordered]@{ Name = $data.Organization.DisplayName; Id = $data.TenantId }
+    SnapshotCount = @($snaps).Count
+    Kpis          = [ordered]@{
+        Members          = $latest.Members
+        EnabledMembers   = $latest.EnabledMembers
+        Guests           = $latest.Guests
+        CaEnabled        = $latest.CaEnabled
+        CaTotal          = $latest.CaTotal
+        RoleAssignments  = $latest.RoleAssignments
+        Groups           = $latest.Groups
+        AppRegistrations = $latest.AppRegistrations
+        CredsInWindow    = $latest.CredsInWindow
+        CredsExpired     = @($credRowsNow | Where-Object { $_.Severity -eq 'expired' }).Count
+    }
+    NewChanges    = $newChanges
+} | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutputPath 'run-summary.json') -Encoding UTF8
+
 Write-Host ''
 Write-Host "Done. Output in $OutputPath`:"
 Write-Host '  docs/         9 Markdown files (commit these - the git diff is your drift report)'
 Write-Host '  tenant.json   the full snapshot'
 Write-Host '  report.html   the shareable report - open it in a browser'
 Write-Host ("  history       {0} snapshot(s) -> trends + change log" -f @($snaps).Count)
+Write-Host ("  run-summary   {0} new change(s) this run - feed it to Send-TenantDocsAlert.ps1" -f @($newChanges).Count)

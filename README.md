@@ -8,6 +8,7 @@ Living documentation for your Entra ID tenant. One read-only PowerShell script, 
 | `tenant.json` | Anything you build on top — the complete structured snapshot. |
 | `report.html` | Everyone else. A self-contained, timestamped report — KPI tiles, trend sparklines, a "what changed" feed, license meters, credential-expiry status, Conditional Access at a glance. No server, no dependencies; open it in a browser, drop it on an intranet share. |
 | `history/` | One JSON snapshot archived per run — the raw material behind trends and the change log. |
+| `run-summary.json` | This run's delta in machine-readable form — what `Send-TenantDocsAlert.ps1` (and anything else you automate) consumes. |
 
 ![Report screenshot](screenshot.png)
 
@@ -54,6 +55,27 @@ git add docs tenant.json history; git commit -m "Tenant snapshot $(Get-Date -For
 git diff HEAD~1 -- docs      # the same drift, as a raw diff
 ```
 
+### Scheduled runs with alerts
+
+`Send-TenantDocsAlert.ps1` turns a run into a notification — **only when something is worth saying**: the tenant changed, or an app credential is now expired. Quiet runs send nothing, so nobody learns to ignore the channel.
+
+- **Teams** — posts an Adaptive Card to a Power Automate **Workflows** webhook (in Teams: channel → Workflows → *"Post to a channel when a webhook request is received"*, copy the URL). Legacy Office 365 connector webhooks were retired in May 2026; this targets the Workflows format only.
+- **Email** — plain text through your internal SMTP relay (unauthenticated relay; no credentials stored anywhere).
+
+Keep the webhook URL out of scripts and task definitions — set it once in the `TENANTDOCS_TEAMS_WEBHOOK` environment variable (machine scope for scheduled tasks).
+
+```powershell
+# run.ps1 - the scheduled pair
+& $PSScriptRoot\Export-EntraTenantDocs.ps1 -OutputPath C:\tenant-docs
+& $PSScriptRoot\Send-TenantDocsAlert.ps1 -RunSummaryPath C:\tenant-docs\run-summary.json -ReportLink '\\fileserver\it\tenant\report.html'
+```
+
+```
+schtasks /Create /TN "Tenant docs weekly" /SC WEEKLY /D MON /ST 07:00 /TR "pwsh -NoProfile -File C:\tools\tenant-docs\run.ps1"
+```
+
+One thing interactive runs hide: a scheduled task can't answer a sign-in prompt. For unattended runs, register an app with the four read scopes as **application** permissions and connect with a certificate before the export (`Connect-MgGraph -ClientId <id> -TenantId <id> -CertificateThumbprint <thumb>`) — the export uses whatever Graph session already exists. `-AlwaysNotify` turns the alert into a daily digest if you prefer a heartbeat.
+
 ## What gets documented (the identity plane)
 
 1. **Tenant** — org info, verified domains, license SKUs (purchased/assigned/available)
@@ -74,7 +96,7 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 
 ## Honesty notes
 
-- **Read-only.** Every call is a GET (plus one `getByIds` POST that only resolves object IDs to display names). The script changes nothing.
+- **Read-only.** Every call is a GET (plus one `getByIds` POST that only resolves object IDs to display names). The export changes nothing in the tenant; the alert script is the only component that sends anything anywhere — to *your* webhook and *your* relay.
 - Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
@@ -85,7 +107,6 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 - Intune: compliance policies and configuration profiles
 - Conditional Access gap analysis (see also the planned CA analyzer)
 - `-Anonymize` switch for sharing output with consultants
-- Scheduled-run wrapper with change alerts (email / Teams webhook)
 
 ## Related tools
 
