@@ -67,6 +67,34 @@
     Skip the Intune section entirely (tenants without Intune degrade
     automatically; this just avoids the attempt).
 
+.PARAMETER Anonymize
+    Replace identifying values in the OUTPUT with stable pseudonyms, so the
+    docs, report and JSON can be shown to someone outside the tenant.
+
+    Replaced: tenant and app ids, organization name, domains, every person's
+    display name and UPN, group names, non-Microsoft app names, named-location
+    names, app-registration and credential names, Intune assignment groups, and
+    the string literals inside dynamic membership rules.
+
+    Kept, because the shape is the point: all counts, license SKU part numbers,
+    built-in role names, policy states, grant and session controls, platforms,
+    client app types, Intune types and setting keys, and dates.
+
+    ALSO KEPT, and worth knowing before you share: Conditional Access and
+    Intune POLICY NAMES are left as written, so the gap analysis stays
+    readable. Those are admin-authored free text and can name a vendor, a
+    person, or a service account. Read them before handing the output over.
+
+    The history archived on disk is NOT anonymized - only the rendered output
+    is - so your own drift history stays intact and readable.
+
+.PARAMETER AnonymizeSalt
+    Fixes the anonymization salt so the same real value maps to the same
+    pseudonym on every run. Without it a fresh random salt is used per run,
+    which is the safer default: anyone holding the output cannot confirm a
+    guessed name by re-deriving its pseudonym. Use this only when you need
+    two separately generated reports to line up.
+
 .EXAMPLE
     .\Export-EntraTenantDocs.ps1
 
@@ -97,7 +125,9 @@ param(
     [ValidateRange(1, 3650)][int]$StaleCredDays = 90,
     [string]$HistoryPath,
     [switch]$NoHistory,
-    [switch]$SkipIntune
+    [switch]$SkipIntune,
+    [switch]$Anonymize,
+    [string]$AnonymizeSalt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -920,6 +950,10 @@ function Write-Docs {
     $md.Add('')
     $md.Add('Snapshot produced by [entra-tenant-docs](https://github.com/JonathanT10/entra-tenant-docs). Section files carry no timestamps, so a git diff of this folder is a config-drift report.')
     $md.Add('')
+    if ($Data.Contains('Anonymized') -and $Data['Anonymized']) {
+        $md.Add('> **Anonymized.** People, groups, domains, app names and tenant ids below are pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune **policy names are real** - they are admin-authored text, so check them before sharing this.')
+        $md.Add('')
+    }
     $md.Add('| Section | At a glance |')
     $md.Add('|---|---|')
     $md.Add("| [1. Tenant](01-tenant.md) | $(@($o.Domains).Count) domain(s), $(@($Data.Licenses).Count) license SKU(s), $($Data.UserCounts.Members) members + $($Data.UserCounts.Guests) guests |")
@@ -1271,6 +1305,10 @@ header .stamp { display: inline-block; margin-top: 8px; padding: 4px 10px;
   border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
   font-size: 12.5px; color: var(--ink-2); }
 header .stamp b { color: var(--ink); font-weight: 600; }
+header .anon { margin-top: 10px; padding: 9px 12px; border-radius: 8px; font-size: 12.5px;
+  line-height: 1.5; color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-left: 3px solid var(--warning); }
+header .anon b { color: var(--ink); font-weight: 650; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
   gap: 12px; margin-bottom: 20px; }
 .card { background: var(--surface); border: 1px solid var(--border);
@@ -1336,6 +1374,7 @@ footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
     <h1 id="t-name"></h1>
     <div class="sub">Entra ID tenant report &middot; read-only snapshot &middot; <span id="t-id"></span></div>
     <div class="stamp">Generated <b id="t-gen"></b> (UTC)</div>
+    <div class="anon" id="t-anon" hidden></div>
   </header>
   <div class="cards" id="kpis"></div>
   <section id="trends-section" hidden><h2>Trends</h2>
@@ -1409,6 +1448,13 @@ const STATE_BADGE = {
 document.getElementById('t-name').textContent = D.Organization.DisplayName || 'Entra tenant';
 document.getElementById('t-id').textContent = 'tenant ' + D.TenantId;
 document.getElementById('t-gen').textContent = (D.GeneratedUtc || '').replace('T', ' ').replace(/(:\d\d)(\..*)?Z?$/, '$1');
+if (D.Anonymized) {
+  const a = document.getElementById('t-anon');
+  a.hidden = false;
+  a.innerHTML = '<b>Anonymized.</b> People, groups, domains, app names and tenant ids on this page are ' +
+    'pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune ' +
+    '<b>policy names are real</b> &mdash; they are admin-authored text, so check them before sharing this.';
+}
 
 // ---- credential rows (same thresholds as the docs: computed server-side severity) ----
 const creds = (D.CredRows || []);
@@ -1730,6 +1776,282 @@ function Normalize-DataDates {
 }
 
 # --------------------------------------------------------------------------- #
+# Anonymization
+#
+# Applied to the in-memory snapshots AFTER this run's real snapshot has been
+# archived and the history has been loaded, and BEFORE anything is rendered.
+# That ordering is what makes it safe and coherent: the history on disk stays
+# real, and every snapshot in the run shares one mapping table, so the change
+# log does not report every admin as removed-and-re-added.
+# --------------------------------------------------------------------------- #
+
+$script:AnonSalt   = $null
+$script:AnonMap    = @{}   # "kind|real value" -> pseudonym
+$script:AnonTaken  = @{}   # pseudonym -> $true, so two real values never merge
+$script:AnonDomain = 'example.com'
+
+function Initialize-Anonymizer {
+    param([string]$Salt)
+    # A fresh salt per run means the output cannot be tested against a guessed
+    # name. A fixed salt trades that away for cross-run stability.
+    $script:AnonSalt  = if ($Salt) { $Salt } else { [guid]::NewGuid().ToString() }
+    $script:AnonMap   = @{}
+    $script:AnonTaken = @{}
+    $script:AnonDomain = 'example.com'
+    $script:AnonDomainLocked = $false
+}
+
+function Get-AnonTag {
+    param([string]$Kind, [string]$Value, [int]$Chars)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$script:AnonSalt|$Kind|$Value")) }
+    finally { $sha.Dispose() }
+    $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    return $hex.Substring(0, $Chars)
+}
+
+function Get-Pseudonym {
+    # Template placeholders: {0} = kind, {1} = tag.
+    # On collision the tag lengthens rather than silently merging two real
+    # identities into one pseudonym - a merge would corrupt the change log.
+    param([string]$Kind, $Value, [string]$Template = '{0} {1}')
+    if ($null -eq $Value -or "$Value" -eq '') { return $Value }
+    $real = "$Value"
+    $key  = "$Kind|$real"
+    if ($script:AnonMap.ContainsKey($key)) { return $script:AnonMap[$key] }
+    for ($chars = 6; $chars -le 32; $chars += 2) {
+        $candidate = $Template -f $Kind, (Get-AnonTag $Kind $real $chars)
+        if (-not $script:AnonTaken.ContainsKey($candidate)) {
+            $script:AnonMap[$key] = $candidate
+            $script:AnonTaken[$candidate] = $true
+            return $candidate
+        }
+        if ($script:AnonMap.ContainsKey($key)) { return $script:AnonMap[$key] }
+    }
+    throw "Anonymizer exhausted the pseudonym space for a '$Kind' value."
+}
+
+function Get-AnonGuid {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $Value }
+    $t = Get-AnonTag 'Guid' "$Value" 32
+    return ($t.Substring(0,8) + '-' + $t.Substring(8,4) + '-' + $t.Substring(12,4) +
+            '-' + $t.Substring(16,4) + '-' + $t.Substring(20,12))
+}
+
+function Test-IsGuidLike { param($v) return ("$v" -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') }
+
+function Get-AnonDomainName {
+    param($Domain)
+    if ($null -eq $Domain -or "$Domain" -eq '') { return $Domain }
+    # Keep the .onmicrosoft.com shape - the report labels the initial domain,
+    # and losing that would make the output read wrong rather than anonymous.
+    $suffix = if ("$Domain" -match '\.onmicrosoft\.com$') { '.onmicrosoft.com' } else { '.com' }
+    return (Get-Pseudonym 'Domain' $Domain ('example-{1}' + $suffix))
+}
+
+function Get-AnonPerson {
+    # Display name is the identity key: it is the only thing Conditional Access
+    # gives us, so keying on it makes the same human map the same way whether
+    # they turn up in a role assignment or a policy exclusion.
+    param($DisplayName, $RealUpn, [string]$Kind = 'Person')
+    # Note the parameter is $RealUpn, not $Upn: PowerShell variable names are
+    # case-insensitive, so a local $upn would silently overwrite the parameter.
+    $key = if ($DisplayName -and "$DisplayName" -ne '') { "$DisplayName" } else { "$RealUpn" }
+    if (-not $key) { return @{ Name = $DisplayName; Upn = $RealUpn } }
+    $name = Get-Pseudonym $Kind $key
+    $newUpn = $null
+    if ($RealUpn -and "$RealUpn" -ne '') {
+        $tag = ("$name" -split ' ')[-1]
+        $newUpn = "$($Kind.ToLowerInvariant())-$tag@$script:AnonDomain"
+    }
+    return @{ Name = $name; Upn = $newUpn }
+}
+
+$script:ANON_KEEP_PRINCIPALS = @('All', 'None', 'GuestsOrExternalUsers')
+$script:ANON_KEEP_APPS = @('All cloud apps', 'None', 'Office 365', 'Microsoft Admin Portals',
+                           'All', 'Office365', 'MicrosoftAdminPortals')
+$script:ANON_KEEP_TARGETS = @('all_users', 'all_devices')
+
+function Get-AnonPrincipalList {
+    param($Values, [string]$Kind)
+    return @(foreach ($v in @($Values)) {
+        if ($null -eq $v -or "$v" -eq '') { continue }
+        elseif ("$v" -in $script:ANON_KEEP_PRINCIPALS) { "$v" }
+        elseif (Test-IsGuidLike $v) { Get-AnonGuid $v }   # stayed unresolved - keep it honest
+        else { Get-Pseudonym $Kind $v }
+    })
+}
+
+function Get-AnonScrubbedString {
+    # Targeted scrub for free-text values we otherwise keep: anything that
+    # looks like an address is replaced, everything else survives.
+    param($Value)
+    if ($null -eq $Value) { return $Value }
+    $s = "$Value"
+    $s = [regex]::Replace($s, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', { param($m) "person-$(Get-AnonTag 'Scrub' $m.Value 6)@$script:AnonDomain" })
+    $s = [regex]::Replace($s, 'https?://[^\s"'')]+', { param($m) "https://example-$(Get-AnonTag 'Scrub' $m.Value 6).com" })
+    $s = [regex]::Replace($s, '\\\\[^\s"'')]+', { param($m) "\\server-$(Get-AnonTag 'Scrub' $m.Value 6)\share" })
+    $s = [regex]::Replace($s, '\b\d{1,3}(\.\d{1,3}){3}\b', { param($m) '203.0.113.0' })
+    return $s
+}
+
+function Get-AnonMembershipRule {
+    # Keep the rule's shape - attributes and operators are Microsoft vocabulary
+    # and the interesting part - and replace only the quoted literals, which is
+    # where department names, domains and cost centres live.
+    param($Rule)
+    if ($null -eq $Rule -or "$Rule" -eq '') { return $Rule }
+    return [regex]::Replace("$Rule", '"([^"]*)"', {
+        param($m)
+        if ($m.Groups[1].Value -eq '') { '""' }
+        else { '"' + (Get-Pseudonym 'Value' $m.Groups[1].Value 'value-{1}') + '"' }
+    })
+}
+
+function Get-AnonIntuneAssignments {
+    param($Assignments)
+    return @(foreach ($a in @($Assignments)) {
+        $s = "$a"
+        if ($s -eq '') { continue }
+        elseif ($s -in @('All devices', 'All users')) { $s }
+        elseif ($s -like 'Exclude: *') {
+            $inner = $s.Substring(9)
+            if (Test-IsGuidLike $inner) { "Exclude: $(Get-AnonGuid $inner)" }
+            else { "Exclude: $(Get-Pseudonym 'Group' $inner)" }
+        }
+        elseif (Test-IsGuidLike $s) { Get-AnonGuid $s }
+        elseif ($s -like '*AssignmentTarget') { $s }   # an odata type we could not name
+        else { Get-Pseudonym 'Group' $s }
+    })
+}
+
+function Protect-TenantData {
+    <# In-place. Idempotent guard: a snapshot already marked Anonymized is left
+       alone, so passing the same object twice cannot double-map it. #>
+    param($Data)
+    if (-not $Data) { return }
+    if ($Data.Contains('Anonymized') -and $Data['Anonymized']) { return }
+
+    # -- domains first: the UPN suffix depends on them --------------------- #
+    $org = $Data['Organization']
+    if ($org) {
+        $mapped = @()
+        foreach ($d in @($org['Domains'])) {
+            $d['Name'] = Get-AnonDomainName $d['Name']
+            $mapped += , $d
+        }
+        $org['Domains'] = @($mapped)
+        # Locked to the first snapshot processed (the current one), so a domain
+        # that existed only in old history cannot shift the UPN suffix midway
+        # and split one person across two spellings.
+        if (-not $script:AnonDomainLocked) {
+            $default = @($mapped | Where-Object { $_['IsDefault'] })
+            $script:AnonDomain = if ($default.Count) { "$($default[0]['Name'])" }
+                                 elseif ($mapped.Count) { "$($mapped[0]['Name'])" }
+                                 else { 'example.com' }
+            $script:AnonDomainLocked = $true
+        }
+        $org['DisplayName'] = Get-Pseudonym 'Org' $org['DisplayName'] 'Example Organization {1}'
+    }
+    $Data['TenantId'] = Get-AnonGuid $Data['TenantId']
+
+    # -- Conditional Access ------------------------------------------------- #
+    $ca = $Data['ConditionalAccess']
+    if ($ca) {
+        foreach ($p in @($ca['Policies'])) {
+            # Policy Name is deliberately left as written - see -Anonymize help.
+            $p['IncludeUsers']  = @(Get-AnonPrincipalList $p['IncludeUsers']  'Person')
+            $p['ExcludeUsers']  = @(Get-AnonPrincipalList $p['ExcludeUsers']  'Person')
+            $p['IncludeGroups'] = @(Get-AnonPrincipalList $p['IncludeGroups'] 'Group')
+            $p['ExcludeGroups'] = @(Get-AnonPrincipalList $p['ExcludeGroups'] 'Group')
+            $p['IncludeApps']   = @(foreach ($a in @($p['IncludeApps'])) {
+                if ("$a" -in $script:ANON_KEEP_APPS) { "$a" }
+                elseif (Test-IsGuidLike $a) { Get-AnonGuid $a } else { Get-Pseudonym 'App' $a } })
+            $p['ExcludeApps']   = @(foreach ($a in @($p['ExcludeApps'])) {
+                if ("$a" -in $script:ANON_KEEP_APPS) { "$a" }
+                elseif (Test-IsGuidLike $a) { Get-AnonGuid $a } else { Get-Pseudonym 'App' $a } })
+            if ($p['Locations']) {
+                $p['Locations']['Include'] = @(foreach ($l in @($p['Locations']['Include'])) {
+                    if ("$l" -in @('All', 'AllTrusted')) { "$l" }
+                    elseif (Test-IsGuidLike $l) { Get-AnonGuid $l } else { Get-Pseudonym 'Location' $l } })
+                $p['Locations']['Exclude'] = @(foreach ($l in @($p['Locations']['Exclude'])) {
+                    if ("$l" -in @('All', 'AllTrusted')) { "$l" }
+                    elseif (Test-IsGuidLike $l) { Get-AnonGuid $l } else { Get-Pseudonym 'Location' $l } })
+            }
+        }
+        foreach ($l in @($ca['NamedLocations'])) {
+            $l['Name'] = Get-Pseudonym 'Location' $l['Name']
+            # Detail is "N range(s), trusted" or a country list - no addresses.
+        }
+    }
+
+    # -- Directory roles ---------------------------------------------------- #
+    foreach ($r in @($Data['Roles'])) {
+        foreach ($m in @($r['Members'])) {
+            # A role member can be a user, a group, or a service principal -
+            # label each as what it is, and share the group map so the same
+            # group reads the same here and in a CA policy.
+            $kind = switch ("$($m['Type'])") {
+                'servicePrincipal' { 'Service' }
+                'group'            { 'Group' }
+                default            { 'Person' }
+            }
+            $pair = Get-AnonPerson $m['DisplayName'] $m['UserPrincipalName'] $kind
+            $m['DisplayName'] = $pair.Name
+            $m['UserPrincipalName'] = $pair.Upn
+        }
+    }
+
+    # -- Groups -------------------------------------------------------------- #
+    $g = $Data['Groups']
+    if ($g) {
+        $g['RoleAssignable'] = @(foreach ($n in @($g['RoleAssignable'])) { Get-Pseudonym 'Group' $n })
+        foreach ($d in @($g['Dynamic'])) {
+            $d['Name'] = Get-Pseudonym 'Group' $d['Name']
+            $d['Rule'] = Get-AnonMembershipRule $d['Rule']
+        }
+    }
+
+    # -- Authentication methods ---------------------------------------------- #
+    foreach ($m in @($Data['AuthMethods'])) {
+        $m['Targets'] = @(foreach ($t in @($m['Targets'])) {
+            if ("$t" -in $script:ANON_KEEP_TARGETS) { "$t" }
+            elseif (Test-IsGuidLike $t) { Get-AnonGuid $t } else { Get-Pseudonym 'Group' $t } })
+    }
+
+    # -- App registrations ---------------------------------------------------- #
+    foreach ($a in @($Data['Applications'])) {
+        $a['Name']  = Get-Pseudonym 'App' $a['Name']
+        $a['AppId'] = Get-AnonGuid $a['AppId']
+        foreach ($c in @($a['Credentials'])) {
+            if ($c['Name']) { $c['Name'] = Get-Pseudonym 'Credential' $c['Name'] }
+        }
+    }
+
+    # -- Intune ---------------------------------------------------------------- #
+    $i = $Data['Intune']
+    if ($i -and $i['Available']) {
+        foreach ($p in @($i['CompliancePolicies'])) {
+            # Policy Name kept, as above.
+            $p['Assignments'] = @(Get-AnonIntuneAssignments $p['Assignments'])
+            if ($p['Settings']) {
+                foreach ($k in @($p['Settings'].Keys)) {
+                    if ($p['Settings'][$k] -is [string]) {
+                        $p['Settings'][$k] = Get-AnonScrubbedString $p['Settings'][$k]
+                    }
+                }
+            }
+        }
+        foreach ($p in @($i['ConfigurationProfiles'])) {
+            $p['Assignments'] = @(Get-AnonIntuneAssignments $p['Assignments'])
+        }
+    }
+
+    $Data['Anonymized'] = $true
+}
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -1756,6 +2078,18 @@ if (-not $NoHistory -and -not $FromJson) {
     Write-Host "Snapshot archived: $savedTo"
 }
 $snaps = Get-History $historyDir $data
+
+if ($Anonymize) {
+    # After archiving (history on disk stays real), before anything is derived
+    # or rendered. Every snapshot in this run shares one mapping table, so the
+    # change log and trends stay coherent across the whole series.
+    Initialize-Anonymizer -Salt $AnonymizeSalt
+    Protect-TenantData $data
+    foreach ($s in @($snaps)) { Protect-TenantData $s }
+    Write-Host 'Anonymized: identities, groups, domains and app names replaced with pseudonyms.'
+    Write-Host '  Policy names are KEPT so the gap analysis stays readable - read them before sharing.'
+}
+
 $trend = Get-TrendSeries $snaps $StaleCredDays
 $changeLog = Get-ChangeLog $snaps
 

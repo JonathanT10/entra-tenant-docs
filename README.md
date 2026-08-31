@@ -39,6 +39,27 @@ Re-render offline from a previous snapshot (no connection, byte-identical output
 .\Export-EntraTenantDocs.ps1 -FromJson .\tenant-docs\tenant.json -OutputPath .\rerender
 ```
 
+### Sharing the output outside the tenant
+
+`-Anonymize` replaces identifying values in the output with stable pseudonyms, so you can put the report in a deck, a portfolio, or a ticket with a vendor.
+
+```powershell
+.\Export-EntraTenantDocs.ps1 -Anonymize -OutputPath .\shareable
+```
+
+Replaced: tenant and app IDs, the organization name, domains, every person's display name and UPN, group names, non-Microsoft app names, named-location names, app-registration and credential names, Intune assignment groups, and the string literals inside dynamic membership rules — `(user.department -eq "Sales")` becomes `(user.department -eq "value-411105")`, so the rule's shape survives while its contents don't.
+
+Kept, because the shape is the whole point: every count, license SKU part numbers, built-in role names, policy states, grant and session controls, platforms, client app types, Intune types and setting keys, and dates. A report where everything is redacted proves nothing.
+
+Two things worth knowing before you hand it over:
+
+- **Policy names are kept.** Conditional Access and Intune policy names are left exactly as written, so the gap analysis stays readable — `satisfied by 'Require MFA for all users'` beats `satisfied by 'Policy 2c9f'`. They are admin-authored free text, so read them first: a policy called `Block legacy auth except svc-vendorname` will say so. Tightening this is the next piece of work on the switch.
+- **The salt is fresh on every run**, so nobody holding the output can confirm a guessed name by re-deriving its pseudonym. That also means two separately generated reports won't line up. `-AnonymizeSalt <string>` pins it when you need them to, at the cost of that protection.
+
+The history archived on disk is **not** anonymized — only the rendered output is — so your own drift history stays real and readable. Every snapshot loaded in a run shares one mapping table, so the change log and trends stay coherent instead of reporting every admin as removed-and-re-added.
+
+The report and `docs/index.md` say plainly that they are anonymized. Pseudonyms that look like real values without saying so would be a worse problem than the one this solves.
+
 ### History, trends, and the change log
 
 Every run archives its snapshot to `history/` (default: under the output folder; `-HistoryPath` moves it, `-NoHistory` skips archiving). From two snapshots onward:
@@ -101,14 +122,23 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 - Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
+- **`-Anonymize` is not a guarantee.** It replaces the categories listed above, and it deliberately keeps Conditional Access and Intune policy names so the gap analysis stays readable. Those are free text an admin wrote, and free text is where surprises live. Read the output before you share it; don't treat the switch as permission to skip that.
 - The CA gap checks are **opinionated baseline hygiene, not a compliance audit** — they encode common guidance (require MFA broadly, block legacy auth, keep break-glass exclusions), and a well-run tenant can still have legitimate reasons to differ.
 - Coverage is the identity plane plus Intune's v1.0 surface. Exchange, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
 - **Settings catalog policies are not documented** — that Intune API is still beta-only in Microsoft Graph, and this tool sticks to v1.0. The classic compliance policies and configuration profiles are covered.
 
+## Tests
+
+```bash
+./tests/run-tests.sh          # needs pwsh, python3, and playwright for the HTML check
+```
+
+31 checks. The one that matters is the leak scan: it harvests every identifying string from the sample snapshot *and* every history snapshot the run reads, then greps all four output types for them and requires zero hits — plus a positive control that SKUs, role names, policy names and counts are still there, since an anonymizer that redacts everything would otherwise pass. The rest cover determinism under a fixed salt, structural parity against the clear render, coherence of the change log across anonymized history, a mocked live run proving the archive keeps real values while the same run's output does not, graceful degradation on snapshots with no Intune or no roles, and executing `report.html` in a real browser to prove it actually renders — the docs and the report take different code paths, and only running the page catches a payload that is valid JSON and silently broken.
+
 ## Roadmap
 
 - Intune settings catalog policies (when the API reaches Graph v1.0)
-- `-Anonymize` switch for sharing output with consultants
+- Harden `-Anonymize`: an option to pseudonymize Conditional Access and Intune policy names too, for output going somewhere you don't control
 
 ## Related tools
 
