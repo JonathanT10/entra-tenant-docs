@@ -26,7 +26,9 @@
       5. Authentication methods policy
       6. User & guest settings (authorization policy) in plain English
       7. App registrations - sign-in audience and credential expiry
-      8. Change log - what changed between snapshots, computed by diffing
+      8. Intune - managed-device overview, compliance policies (settings +
+         assignments), configuration profiles, app protection policies
+      9. Change log - what changed between snapshots, computed by diffing
 
     Each run also archives its snapshot to history/ - from two snapshots
     onward the report gains trend sparklines and a "what changed" feed -
@@ -59,6 +61,10 @@
     Do not archive this run's snapshot. Trends and the change log still
     render from whatever history already exists.
 
+.PARAMETER SkipIntune
+    Skip the Intune section entirely (tenants without Intune degrade
+    automatically; this just avoids the attempt).
+
 .EXAMPLE
     .\Export-EntraTenantDocs.ps1
 
@@ -73,6 +79,8 @@
     Required Graph scopes (all read-only):
         Directory.Read.All, Policy.Read.All,
         RoleManagement.Read.Directory, Application.Read.All
+        + for Intune: DeviceManagementConfiguration.Read.All,
+          DeviceManagementManagedDevices.Read.All, DeviceManagementApps.Read.All
     Required module:
         Microsoft.Graph.Authentication (only)
 
@@ -86,7 +94,8 @@ param(
     [switch]$SampleData,
     [ValidateRange(1, 3650)][int]$StaleCredDays = 90,
     [string]$HistoryPath,
-    [switch]$NoHistory
+    [switch]$NoHistory,
+    [switch]$SkipIntune
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,11 +148,13 @@ function Iso {
 # --------------------------------------------------------------------------- #
 
 function Get-TenantData {
-    param([int]$StaleCredDays)
+    param([int]$StaleCredDays, [switch]$SkipIntune)
 
     if (-not (Get-MgContext)) {
         Connect-MgGraph -Scopes 'Directory.Read.All','Policy.Read.All',
-            'RoleManagement.Read.Directory','Application.Read.All' -NoWelcome
+            'RoleManagement.Read.Directory','Application.Read.All',
+            'DeviceManagementConfiguration.Read.All','DeviceManagementManagedDevices.Read.All',
+            'DeviceManagementApps.Read.All' -NoWelcome
     }
 
     $G = 'https://graph.microsoft.com/v1.0'
@@ -381,6 +392,126 @@ function Get-TenantData {
         }
     })
 
+    # -- 8. Intune (v1.0 endpoints only; degrades when absent) ----------------- #
+    $intune = [ordered]@{ Available = $false }
+    if (-not $SkipIntune) {
+        Write-Host 'Collecting Intune (skipped automatically if not licensed)...'
+        try {
+            $ov = Invoke-MgGraphRequest -Method GET -Uri "$G/deviceManagement/managedDeviceOverview" -OutputType PSObject
+            $os = $ov.deviceOperatingSystemSummary
+            $devices = [ordered]@{
+                Total   = [int]$ov.enrolledDeviceCount
+                Windows = [int]$os.windowsCount
+                MacOS   = [int]$os.macOSCount
+                IOS     = [int]$os.iosCount
+                Android = [int]$os.androidCount
+                Other   = [Math]::Max(0, [int]$ov.enrolledDeviceCount - [int]$os.windowsCount - [int]$os.macOSCount - [int]$os.iosCount - [int]$os.androidCount)
+            }
+            $cs = Invoke-MgGraphRequest -Method GET -Uri "$G/deviceManagement/deviceCompliancePolicyDeviceStateSummary" -OutputType PSObject
+            $complianceSummary = [ordered]@{
+                Compliant     = [int]$cs.compliantDeviceCount
+                NonCompliant  = [int]$cs.nonCompliantDeviceCount
+                InGracePeriod = [int]$cs.inGracePeriodCount
+                Error         = [int]$cs.errorDeviceCount
+                Conflict      = [int]$cs.conflictDeviceCount
+                Unknown       = [int]$cs.unknownDeviceCount
+            }
+
+            $rawCompliance = Get-GraphPage "$G/deviceManagement/deviceCompliancePolicies?`$expand=assignments"
+            $rawConfigs    = Get-GraphPage "$G/deviceManagement/deviceConfigurations?`$expand=assignments"
+
+            # Resolve assignment group ids to names (one POST)
+            $iIds = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($pol in @($rawCompliance) + @($rawConfigs)) {
+                foreach ($a in @($pol.assignments)) {
+                    if ($a.target.groupId) { [void]$iIds.Add("$($a.target.groupId)") }
+                }
+            }
+            $iNameById = @{}
+            if ($iIds.Count) {
+                try {
+                    $b = @{ ids = @($iIds); types = @('group') } | ConvertTo-Json
+                    $res = Invoke-MgGraphRequest -Method POST -Uri "$G/directoryObjects/getByIds" `
+                        -Body $b -ContentType 'application/json' -OutputType PSObject
+                    foreach ($o in @($res.value)) { $iNameById[$o.id] = $o.displayName }
+                }
+                catch { Write-Warning "Intune getByIds failed ($($_.Exception.Message)) - group GUIDs left unresolved." }
+            }
+            function Resolve-IntuneAssignments {
+                param($Assignments)
+                $out = @(foreach ($a in @($Assignments)) {
+                    $t = $a.target
+                    switch -Wildcard ("$($t.'@odata.type')") {
+                        '*allDevicesAssignmentTarget'        { 'All devices' }
+                        '*allLicensedUsersAssignmentTarget'  { 'All users' }
+                        '*exclusionGroupAssignmentTarget'    {
+                            $n = if ($iNameById.ContainsKey("$($t.groupId)")) { $iNameById["$($t.groupId)"] } else { "$($t.groupId)" }
+                            "Exclude: $n" }
+                        '*groupAssignmentTarget'             {
+                            if ($iNameById.ContainsKey("$($t.groupId)")) { $iNameById["$($t.groupId)"] } else { "$($t.groupId)" } }
+                        default                              { "$($t.'@odata.type')" -replace '#microsoft.graph.', '' }
+                    }
+                })
+                return @($out | Sort-Object)
+            }
+            function Get-FriendlyType {
+                param($OdataType)
+                ("$OdataType" -replace '#microsoft.graph.', '')
+            }
+            # Generic scalar-settings dump: honest and vendor-agnostic
+            $SKIP_PROPS = @('id', 'displayName', 'description', 'createdDateTime', 'lastModifiedDateTime',
+                            'version', '@odata.type', 'roleScopeTagIds', 'assignments', 'scheduledActionsForRule',
+                            'deviceSettingStateSummaries', 'deviceStatuses', 'userStatuses',
+                            'deviceStatusOverview', 'userStatusOverview')
+            $compliancePolicies = @($rawCompliance | Sort-Object displayName | ForEach-Object {
+                $settings = [ordered]@{}
+                foreach ($prop in ($_.PSObject.Properties | Sort-Object Name)) {
+                    if ($prop.Name -in $SKIP_PROPS) { continue }
+                    $v = $prop.Value
+                    if ($null -eq $v) { continue }
+                    if ($v -is [datetime]) { $settings[$prop.Name] = Iso $v }
+                    elseif ($v -is [bool] -or $v -is [string] -or $v -is [int] -or $v -is [long] -or $v -is [double]) {
+                        $settings[$prop.Name] = $v
+                    }
+                }
+                [ordered]@{
+                    Name        = $_.displayName
+                    Type        = Get-FriendlyType $_.'@odata.type'
+                    Assignments = Resolve-IntuneAssignments $_.assignments
+                    Settings    = $settings
+                }
+            })
+            $configurationProfiles = @($rawConfigs | Sort-Object displayName | ForEach-Object {
+                [ordered]@{
+                    Name        = $_.displayName
+                    Type        = Get-FriendlyType $_.'@odata.type'
+                    Assignments = Resolve-IntuneAssignments $_.assignments
+                }
+            })
+
+            $appProtection = @()
+            try {
+                $rawMam = Get-GraphPage "$G/deviceAppManagement/managedAppPolicies"
+                $appProtection = @($rawMam | Sort-Object displayName | ForEach-Object {
+                    [ordered]@{ Name = $_.displayName; Type = Get-FriendlyType $_.'@odata.type' }
+                })
+            }
+            catch { Write-Warning "App protection policies unavailable ($($_.Exception.Message)) - subsection skipped." }
+
+            $intune = [ordered]@{
+                Available             = $true
+                Devices               = $devices
+                ComplianceSummary     = $complianceSummary
+                CompliancePolicies    = $compliancePolicies
+                ConfigurationProfiles = $configurationProfiles
+                AppProtection         = $appProtection
+            }
+        }
+        catch {
+            Write-Warning "Intune unavailable ($($_.Exception.Message)) - section skipped. (Needs an Intune license and the DeviceManagement*.Read.All scopes.)"
+        }
+    }
+
     return [ordered]@{
         GeneratedUtc     = $nowUtc.ToString('o')
         TenantId         = (Get-MgContext).TenantId
@@ -397,6 +528,7 @@ function Get-TenantData {
         AuthMethods       = $authMethods
         UserSettings      = $userSettings
         Applications      = $apps
+        Intune            = $intune
     }
 }
 
@@ -497,6 +629,8 @@ function Get-TrendSeries {
             AppRegistrations = @($s.Applications).Count
             LicenseAssigned  = $la
             CredsInWindow    = @(Get-CredRows $s $WarnDays | Where-Object { $_.Severity -ne 'ok' }).Count
+            EnrolledDevices  = if ($s.Intune -and $s.Intune.Available) { [int]$s.Intune.Devices.Total } else { $null }
+            NonCompliantDevices = if ($s.Intune -and $s.Intune.Available) { [int]$s.Intune.ComplianceSummary.NonCompliant } else { $null }
         }
     })
     return , $rows
@@ -598,6 +732,34 @@ function Get-SnapshotChanges {
         }
     }
 
+    # Intune (only when both snapshots have it - older snapshots may predate the section)
+    if ($Prev.Intune -and $Curr.Intune -and $Prev.Intune.Available -and $Curr.Intune.Available) {
+        $pc = _map $Prev.Intune.CompliancePolicies { param($x) $x.Name }
+        $cc = _map $Curr.Intune.CompliancePolicies { param($x) $x.Name }
+        foreach ($k in $cc.Keys) {
+            if (-not $pc.Contains($k)) { & $add 'Intune compliance' 'added' $k $cc[$k].Type; continue }
+            if (($pc[$k] | ConvertTo-Json -Depth 6 -Compress) -ne ($cc[$k] | ConvertTo-Json -Depth 6 -Compress)) {
+                & $add 'Intune compliance' 'changed' $k 'settings or assignments changed'
+            }
+        }
+        foreach ($k in $pc.Keys) { if (-not $cc.Contains($k)) { & $add 'Intune compliance' 'removed' $k '' } }
+
+        $pf = _map $Prev.Intune.ConfigurationProfiles { param($x) $x.Name }
+        $cf = _map $Curr.Intune.ConfigurationProfiles { param($x) $x.Name }
+        foreach ($k in $cf.Keys) {
+            if (-not $pf.Contains($k)) { & $add 'Intune configuration' 'added' $k $cf[$k].Type; continue }
+            if (($pf[$k] | ConvertTo-Json -Depth 6 -Compress) -ne ($cf[$k] | ConvertTo-Json -Depth 6 -Compress)) {
+                & $add 'Intune configuration' 'changed' $k 'type or assignments changed'
+            }
+        }
+        foreach ($k in $pf.Keys) { if (-not $cf.Contains($k)) { & $add 'Intune configuration' 'removed' $k '' } }
+
+        $pm = _map $Prev.Intune.AppProtection { param($x) $x.Name }
+        $cm = _map $Curr.Intune.AppProtection { param($x) $x.Name }
+        foreach ($k in $cm.Keys) { if (-not $pm.Contains($k)) { & $add 'App protection' 'added' $k '' } }
+        foreach ($k in $pm.Keys) { if (-not $cm.Contains($k)) { & $add 'App protection' 'removed' $k '' } }
+    }
+
     # App registrations (by AppId)
     $pApp = _map $Prev.Applications { param($x) $x.AppId }
     $cApp = _map $Curr.Applications { param($x) $x.AppId }
@@ -652,7 +814,11 @@ function Write-Docs {
     $md.Add("| [5. Authentication methods](05-authentication.md) | $(@($Data.AuthMethods | Where-Object { $_.State -eq 'enabled' }).Count) of $(@($Data.AuthMethods).Count) methods enabled |")
     $md.Add("| [6. User & guest settings](06-user-settings.md) | $(@($Data.UserSettings.Keys).Count) settings documented |")
     $md.Add("| [7. Applications](07-applications.md) | $(@($Data.Applications).Count) registrations, $(@($expiring).Count) credential(s) expiring/expired |")
-    $md.Add("| [8. Change log](08-changelog.md) | $(@($ChangeLog).Count) change(s) across $SnapCount snapshot(s) |")
+    $intuneGlance = if ($Data.Intune -and $Data.Intune.Available) {
+        "$($Data.Intune.Devices.Total) device(s), $(@($Data.Intune.CompliancePolicies).Count) compliance policies, $(@($Data.Intune.ConfigurationProfiles).Count) profiles"
+    } else { 'Not available in this snapshot' }
+    $md.Add("| [8. Intune](08-intune.md) | $intuneGlance |")
+    $md.Add("| [9. Change log](09-changelog.md) | $(@($ChangeLog).Count) change(s) across $SnapCount snapshot(s) |")
     $md -join "`n" | Set-Content -Path (Join-Path $DocsPath 'index.md') -Encoding UTF8
 
     # ---- 01-tenant.md ---- #
@@ -841,11 +1007,69 @@ function Write-Docs {
     }
     $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '07-applications.md') -Encoding UTF8
 
-    # ---- 08-changelog.md ---- #
+    # ---- 08-intune.md ---- #
+    $i = $Data.Intune
+    $md = New-Object System.Collections.Generic.List[string]
+    $md.Add('# 8. Intune')
+    $md.Add('')
+    if ($i -and $i.Available) {
+        $md.Add('## Managed devices')
+        $md.Add('')
+        $md.Add('| | |')
+        $md.Add('|---|---:|')
+        foreach ($k in $i.Devices.Keys) { $md.Add("| $k | $($i.Devices[$k]) |") }
+        $md.Add('')
+        $md.Add('## Compliance state')
+        $md.Add('')
+        $md.Add('| | |')
+        $md.Add('|---|---:|')
+        foreach ($k in $i.ComplianceSummary.Keys) { $md.Add("| $k | $($i.ComplianceSummary[$k]) |") }
+        $md.Add('')
+        $md.Add('## Compliance policies')
+        if (@($i.CompliancePolicies).Count) {
+            foreach ($p in @($i.CompliancePolicies)) {
+                $md.Add('')
+                $md.Add("### $(MdEscape $p.Name)")
+                $md.Add('')
+                $md.Add("Type: $($p.Type) | Assigned to: $(MdEscape ((@($p.Assignments) -join '; ')))")
+                if (@($p.Settings.Keys).Count) {
+                    $md.Add('')
+                    $md.Add('| Setting | Value |')
+                    $md.Add('|---|---|')
+                    foreach ($k in $p.Settings.Keys) { $md.Add("| $(MdEscape $k) | $(MdEscape $p.Settings[$k]) |") }
+                }
+            }
+        } else { $md.Add(''); $md.Add('None defined.') }
+        $md.Add('')
+        $md.Add('## Configuration profiles')
+        $md.Add('')
+        if (@($i.ConfigurationProfiles).Count) {
+            $md.Add('| Profile | Type | Assigned to |')
+            $md.Add('|---|---|---|')
+            foreach ($p in @($i.ConfigurationProfiles)) {
+                $md.Add("| $(MdEscape $p.Name) | $($p.Type) | $(MdEscape ((@($p.Assignments) -join '; '))) |")
+            }
+        } else { $md.Add('None defined.') }
+        $md.Add('')
+        $md.Add('## App protection policies')
+        $md.Add('')
+        if (@($i.AppProtection).Count) {
+            $md.Add('| Policy | Type |')
+            $md.Add('|---|---|')
+            foreach ($p in @($i.AppProtection)) { $md.Add("| $(MdEscape $p.Name) | $($p.Type) |") }
+        } else { $md.Add('None defined.') }
+        $md.Add('')
+        $md.Add('Settings catalog policies are not included - that API is still beta-only in Microsoft Graph.')
+    } else {
+        $md.Add('Not available in this snapshot (no Intune license, missing scopes, or -SkipIntune).')
+    }
+    $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '08-intune.md') -Encoding UTF8
+
+    # ---- 09-changelog.md ---- #
     # The one section file that carries timestamps by design: it only gains
     # lines when the tenant actually changed between snapshots.
     $md = New-Object System.Collections.Generic.List[string]
-    $md.Add('# 8. Change log')
+    $md.Add('# 9. Change log')
     $md.Add('')
     $md.Add("Computed from $SnapCount archived snapshot(s). Only snapshots where something changed appear below, newest first.")
     if (@($ChangeLog).Count) {
@@ -862,7 +1086,7 @@ function Write-Docs {
         $md.Add('')
         $md.Add($(if ($SnapCount -lt 2) { 'History starts here - the change log fills in from the next run onward.' } else { 'No configuration changes detected between snapshots.' }))
     }
-    $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '08-changelog.md') -Encoding UTF8
+    $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '09-changelog.md') -Encoding UTF8
 }
 
 # --------------------------------------------------------------------------- #
@@ -1007,6 +1231,12 @@ footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
     <p class="note">Assigned vs purchased, per SKU.</p>
     <div id="licenses"></div>
   </section>
+  <section id="intune-section" hidden><h2>Intune</h2>
+    <div class="cards" id="intune-tiles" style="margin-bottom:8px"></div>
+    <p class="note" id="intune-note"></p>
+    <div style="overflow-x:auto"><table id="intune-compliance"></table></div>
+    <div id="intune-extra"></div>
+  </section>
   <section><h2>Groups</h2>
     <div class="cards" id="group-tiles" style="margin-bottom:6px"></div>
     <div id="groups-extra"></div>
@@ -1079,7 +1309,9 @@ if (series.length >= 2) {
     { k: 'CaEnabled', label: 'CA policies enforced' },
     { k: 'RoleAssignments', label: 'Role assignments' },
     { k: 'AppRegistrations', label: 'App registrations' },
-    { k: 'CredsInWindow', label: 'Credentials to renew' }
+    { k: 'CredsInWindow', label: 'Credentials to renew' },
+    { k: 'EnrolledDevices', label: 'Enrolled devices' },
+    { k: 'NonCompliantDevices', label: 'Non-compliant devices' }
   ];
   function spark(vals) {
     const w = 220, h = 40, pad = 3;
@@ -1096,13 +1328,19 @@ if (series.length >= 2) {
       '<circle cx="' + lastX + '" cy="' + lastY + '" r="3" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"></circle></svg>';
   }
   document.getElementById('trends').innerHTML = METRICS.map(m => {
-    const vals = series.map(r => Number(r[m.k] || 0));
+    // Trailing run of non-null points: newer sections (e.g. Intune) may not
+    // exist in older snapshots - chart only from where the data begins.
+    let vals = series.map(r => (r[m.k] === null || r[m.k] === undefined) ? null : Number(r[m.k]));
+    let start = vals.length;
+    for (let i = vals.length - 1; i >= 0 && vals[i] !== null; i--) start = i;
+    vals = vals.slice(start);
+    if (vals.length < 2) return '';
     const cur = vals[vals.length - 1], prev = vals[vals.length - 2];
     const d = cur - prev;
     const delta = d === 0 ? 'no change' : (d > 0 ? '+' : '') + d + ' since last';
     return '<div class="trend"><div class="k">' + esc(m.label) + '</div><div class="v">' + esc(cur) +
       ' <span class="d">' + esc(delta) + '</span></div>' + spark(vals) + '</div>';
-  }).join('');
+  }).filter(Boolean).join('');
 }
 
 // ---- What changed ----
@@ -1113,7 +1351,7 @@ if (changes.length) {
   changes.forEach(c => { (byTs[c.Ts] = byTs[c.Ts] || []).push(c); });
   const tss = Object.keys(byTs).sort().reverse();
   document.getElementById('changes-note').textContent = changes.length + ' change(s) across ' +
-    tss.length + ' snapshot(s). Full history in docs/08-changelog.md.';
+    tss.length + ' snapshot(s). Full history in docs/09-changelog.md.';
   const KINDWORD = { added: 'Added', removed: 'Removed', changed: 'Changed' };
   const CAP = 4;
   document.getElementById('changes').innerHTML = tss.slice(0, CAP).map(ts =>
@@ -1123,7 +1361,7 @@ if (changes.length) {
       esc(c.Item) + (c.Detail ? ' \u2014 ' + esc(c.Detail) : '') +
       ' <span class="cat">\u00B7 ' + esc(c.Category) + '</span></span></div>'
     ).join('')
-  ).join('') + (tss.length > CAP ? '<p class="note" style="margin-top:8px">Older changes in docs/08-changelog.md.</p>' : '');
+  ).join('') + (tss.length > CAP ? '<p class="note" style="margin-top:8px">Older changes in docs/09-changelog.md.</p>' : '');
 } else if (series.length >= 2) {
   document.getElementById('changes-section').hidden = false;
   document.getElementById('changes-note').textContent = 'No configuration changes detected between snapshots.';
@@ -1220,6 +1458,47 @@ document.getElementById('licenses').innerHTML = (D.Licenses || []).map(l => {
     '</div></div><div class="c">' + pct + '%</div></div>';
 }).join('') || '<p class="note">No license data.</p>';
 
+// ---- Intune ----
+const IN = D.Intune;
+if (IN && IN.Available) {
+  document.getElementById('intune-section').hidden = false;
+  const dev = IN.Devices || {}, comp = IN.ComplianceSummary || {};
+  document.getElementById('intune-tiles').innerHTML = [
+    { k: 'Devices', v: dev.Total }, { k: 'Windows', v: dev.Windows },
+    { k: 'macOS', v: dev.MacOS }, { k: 'iOS', v: dev.IOS },
+    { k: 'Android', v: dev.Android }, { k: 'Non-compliant', v: comp.NonCompliant }
+  ].map(x => '<div class="card"><div class="k">' + esc(x.k) + '</div><div class="v">' + esc(x.v == null ? 0 : x.v) +
+    '</div></div>').join('');
+  const compBits = [badge('good', 'check', (comp.Compliant || 0) + ' compliant')];
+  compBits.push((comp.NonCompliant || 0) > 0
+    ? badge('critical', 'warn', comp.NonCompliant + ' non-compliant')
+    : '<span class="badge muted">' + ICONS.dash + '0 non-compliant</span>');
+  if ((comp.InGracePeriod || 0) > 0) compBits.push(badge('warning', 'clock', comp.InGracePeriod + ' in grace period'));
+  document.getElementById('intune-note').innerHTML =
+    compBits.join(' &nbsp; ') + ' &nbsp; <span class="muted">Full detail in docs/08-intune.md.</span>';
+  const pols = (IN.CompliancePolicies || []);
+  document.getElementById('intune-compliance').innerHTML = pols.length
+    ? '<tr><th>Compliance policy</th><th>Type</th><th>Assigned to</th><th class="num">Settings</th></tr>' +
+      pols.map(p => '<tr><td>' + esc(p.Name) + '</td><td>' + esc(p.Type) + '</td><td>' +
+        esc((p.Assignments || []).join(', ')) + '</td><td class="num">' +
+        Object.keys(p.Settings || {}).length + '</td></tr>').join('')
+    : '<tr><td class="muted">No compliance policies defined.</td></tr>';
+  let ix = '';
+  const profs = (IN.ConfigurationProfiles || []);
+  if (profs.length) {
+    ix += '<details><summary>Configuration profiles (' + profs.length + ')</summary><ul class="plain">' +
+      profs.map(p => '<li>' + esc(p.Name) + ' <span class="muted">\u00B7 ' + esc(p.Type) +
+        ' \u00B7 ' + esc((p.Assignments || []).join(', ')) + '</span></li>').join('') + '</ul></details>';
+  }
+  const mam = (IN.AppProtection || []);
+  if (mam.length) {
+    ix += '<details><summary>App protection policies (' + mam.length + ')</summary><ul class="plain">' +
+      mam.map(p => '<li>' + esc(p.Name) + ' <span class="muted">\u00B7 ' + esc(p.Type) + '</span></li>').join('') +
+      '</ul></details>';
+  }
+  document.getElementById('intune-extra').innerHTML = ix;
+}
+
 // ---- Groups ----
 const g = D.Groups;
 document.getElementById('group-tiles').innerHTML = [
@@ -1307,7 +1586,7 @@ $data = if ($FromJson) {
     Write-Host "Rendering from $FromJson (no Graph connection)..."
     Get-Content $FromJson -Raw | ConvertFrom-Json -AsHashtable
 } else {
-    Get-TenantData -StaleCredDays $StaleCredDays
+    Get-TenantData -StaleCredDays $StaleCredDays -SkipIntune:$SkipIntune
 }
 
 Normalize-DataDates $data
@@ -1350,13 +1629,15 @@ $newChanges = @(@($changeLog) | Where-Object { "$($_.Ts)" -eq "$($data.Generated
         AppRegistrations = $latest.AppRegistrations
         CredsInWindow    = $latest.CredsInWindow
         CredsExpired     = @($credRowsNow | Where-Object { $_.Severity -eq 'expired' }).Count
+        EnrolledDevices  = $latest.EnrolledDevices
+        NonCompliantDevices = $latest.NonCompliantDevices
     }
     NewChanges    = $newChanges
 } | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutputPath 'run-summary.json') -Encoding UTF8
 
 Write-Host ''
 Write-Host "Done. Output in $OutputPath`:"
-Write-Host '  docs/         9 Markdown files (commit these - the git diff is your drift report)'
+Write-Host '  docs/         10 Markdown files (commit these - the git diff is your drift report)'
 Write-Host '  tenant.json   the full snapshot'
 Write-Host '  report.html   the shareable report - open it in a browser'
 Write-Host ("  history       {0} snapshot(s) -> trends + change log" -f @($snaps).Count)

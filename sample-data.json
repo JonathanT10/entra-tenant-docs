@@ -378,5 +378,83 @@
         }
       ]
     }
-  ]
+  ],
+  "Intune": {
+    "Available": true,
+    "Devices": {
+      "Total": 84,
+      "Windows": 60,
+      "MacOS": 4,
+      "IOS": 12,
+      "Android": 8,
+      "Other": 0
+    },
+    "ComplianceSummary": {
+      "Compliant": 76,
+      "NonCompliant": 4,
+      "InGracePeriod": 2,
+      "Error": 0,
+      "Conflict": 0,
+      "Unknown": 2
+    },
+    "CompliancePolicies": [
+      {
+        "Name": "Windows compliance baseline",
+        "Type": "windows10CompliancePolicy",
+        "Assignments": [
+          "All devices",
+          "Exclude: Intune Pilot"
+        ],
+        "Settings": {
+          "osMinimumVersion": "10.0.19045",
+          "passwordMinimumLength": 8,
+          "passwordRequired": true,
+          "storageRequireEncryption": true
+        }
+      },
+      {
+        "Name": "iOS compliance",
+        "Type": "iosCompliancePolicy",
+        "Assignments": [
+          "Mobile Users"
+        ],
+        "Settings": {
+          "passcodeRequired": true
+        }
+      }
+    ],
+    "ConfigurationProfiles": [
+      {
+        "Name": "Windows - BitLocker",
+        "Type": "windows10EndpointProtectionConfiguration",
+        "Assignments": [
+          "All devices"
+        ]
+      },
+      {
+        "Name": "Windows - OneDrive KFM",
+        "Type": "windows10GeneralConfiguration",
+        "Assignments": [
+          "Intune Pilot"
+        ]
+      },
+      {
+        "Name": "iOS - Mail profile",
+        "Type": "iosGeneralDeviceConfiguration",
+        "Assignments": [
+          "Mobile Users"
+        ]
+      }
+    ],
+    "AppProtection": [
+      {
+        "Name": "Android app protection",
+        "Type": "androidManagedAppProtection"
+      },
+      {
+        "Name": "iOS app protection",
+        "Type": "iosManagedAppProtection"
+      }
+    ]
+  }
 }

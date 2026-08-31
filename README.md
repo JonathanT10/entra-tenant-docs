@@ -4,7 +4,7 @@ Living documentation for your Entra ID tenant. One read-only PowerShell script, 
 
 | Output | Who it's for |
 |---|---|
-| `docs/` — 9 numbered Markdown files | Admins, auditors, change records. Deterministic output with no timestamps in the section files, so **committing the folder to git turns every re-run into a config-drift diff.** Includes a computed change log. |
+| `docs/` — 10 numbered Markdown files | Admins, auditors, change records. Deterministic output with no timestamps in the section files, so **committing the folder to git turns every re-run into a config-drift diff.** Includes a computed change log. |
 | `tenant.json` | Anything you build on top — the complete structured snapshot. |
 | `report.html` | Everyone else. A self-contained, timestamped report — KPI tiles, trend sparklines, a "what changed" feed, license meters, credential-expiry status, Conditional Access at a glance. No server, no dependencies; open it in a browser, drop it on an intranet share. |
 | `history/` | One JSON snapshot archived per run — the raw material behind trends and the change log. |
@@ -31,7 +31,7 @@ Install-Module Microsoft.Graph.Authentication -Scope CurrentUser   # the only mo
 .\Export-EntraTenantDocs.ps1                                       # connects, collects, writes .\tenant-docs\
 ```
 
-Required scopes (all read-only): `Directory.Read.All`, `Policy.Read.All`, `RoleManagement.Read.Directory`, `Application.Read.All`. Everything is raw `Invoke-MgGraphRequest` calls — no dependency on the twenty-odd Graph submodules.
+Required scopes (all read-only): `Directory.Read.All`, `Policy.Read.All`, `RoleManagement.Read.Directory`, `Application.Read.All` — plus, for the Intune section, `DeviceManagementConfiguration.Read.All`, `DeviceManagementManagedDevices.Read.All`, `DeviceManagementApps.Read.All` (skip them and the section degrades; `-SkipIntune` skips the attempt entirely). Everything is raw `Invoke-MgGraphRequest` calls — no dependency on the twenty-odd Graph submodules.
 
 Re-render offline from a previous snapshot (no connection, byte-identical output):
 
@@ -44,7 +44,7 @@ Re-render offline from a previous snapshot (no connection, byte-identical output
 Every run archives its snapshot to `history/` (default: under the output folder; `-HistoryPath` moves it, `-NoHistory` skips archiving). From two snapshots onward:
 
 - **Trends** appear in the report — sparklines for members, guests, enforced CA policies, role assignments, app registrations, and credentials in the renewal window, each with its change since the previous snapshot.
-- **What changed** appears in the report and in `docs/08-changelog.md` — the computed diff between snapshots, in English: who got a role, which CA policy flipped state, which dynamic rule was edited, what got bought.
+- **What changed** appears in the report and in `docs/09-changelog.md` — the computed diff between snapshots, in English: who got a role, which CA policy flipped state, which dynamic rule was edited, what got bought.
 
 Schedule it weekly and the change log writes itself:
 
@@ -76,7 +76,7 @@ schtasks /Create /TN "Tenant docs weekly" /SC WEEKLY /D MON /ST 07:00 /TR "pwsh 
 
 One thing interactive runs hide: a scheduled task can't answer a sign-in prompt. For unattended runs, register an app with the four read scopes as **application** permissions and connect with a certificate before the export (`Connect-MgGraph -ClientId <id> -TenantId <id> -CertificateThumbprint <thumb>`) — the export uses whatever Graph session already exists. `-AlwaysNotify` turns the alert into a daily digest if you prefer a heartbeat.
 
-## What gets documented (the identity plane)
+## What gets documented
 
 1. **Tenant** — org info, verified domains, license SKUs (purchased/assigned/available)
 2. **Conditional Access** — every policy rendered readable (users, groups, roles, apps, platforms, locations, client apps, risk, grant and session controls — GUIDs resolved to names), plus named locations
@@ -85,7 +85,8 @@ One thing interactive runs hide: a scheduled task can't answer a sign-in prompt.
 5. **Authentication methods policy** — which methods are enabled, for whom
 6. **User & guest settings** — the authorization policy in plain English (who can invite guests, who can register apps, guest access level)
 7. **App registrations** — sign-in audience and credential expiry, soonest first
-8. **Change log** — computed by diffing consecutive snapshots: CA policies added/removed/state-changed, role assignments granted/revoked, purchased-license changes, dynamic-rule edits, auth-method toggles, setting flips, app registrations added/removed
+8. **Intune** — managed-device overview by platform, compliance state summary, compliance policies (scalar settings and assignments, group GUIDs resolved), configuration profiles, app protection policies. Degrades gracefully when the tenant has no Intune (or use `-SkipIntune`)
+9. **Change log** — computed by diffing consecutive snapshots: CA policies added/removed/state-changed, role assignments granted/revoked, purchased-license changes, dynamic-rule edits, auth-method toggles, setting flips, app registrations added/removed, Intune policy/profile changes
 
 ## How this differs from the existing tools
 
@@ -100,11 +101,12 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 - Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
-- The identity plane only, for now. Exchange, Intune, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
+- Coverage is the identity plane plus Intune's v1.0 surface. Exchange, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
+- **Settings catalog policies are not documented** — that Intune API is still beta-only in Microsoft Graph, and this tool sticks to v1.0. The classic compliance policies and configuration profiles are covered.
 
 ## Roadmap
 
-- Intune: compliance policies and configuration profiles
+- Intune settings catalog policies (when the API reaches Graph v1.0)
 - Conditional Access gap analysis (see also the planned CA analyzer)
 - `-Anonymize` switch for sharing output with consultants
 
