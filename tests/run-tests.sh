@@ -154,6 +154,23 @@ else
 fi
 
 echo
+echo "--- 10. the PowerShell 5.1 fallback converter ------------------------"
+# ps51-shim.ps1 replaces ConvertFrom-Json with a no-AsHashtable version, so the
+# feature detection takes the 5.1 path. Same inputs, both paths, byte-identical
+# outputs - the strongest claim the suite can make without a real 5.1 box.
+rm -rf $T/out-shim $T/out-shim-anon
+$PWSH -NoProfile -Command ". '$HERE/ps51-shim.ps1'; & '$SCRIPT' -SampleData -OutputPath '$T/out-shim'" > $T/shim.log 2>&1 \
+  || bad "shim render" "$(tail -5 $T/shim.log)"
+if diff -r $T/out-clear $T/out-shim >/dev/null 2>&1; then
+  ok "fallback converter renders byte-identical to the native path"
+else bad "fallback converter" "$(diff -rq $T/out-clear $T/out-shim | head -5)"; fi
+$PWSH -NoProfile -Command ". '$HERE/ps51-shim.ps1'; & '$SCRIPT' -SampleData -Anonymize -AnonymizeSalt fixed-salt -OutputPath '$T/out-shim-anon'" > $T/shim2.log 2>&1 \
+  || bad "shim anonymized render" "$(tail -5 $T/shim2.log)"
+if diff -r $T/out-s1 $T/out-shim-anon >/dev/null 2>&1; then
+  ok "anonymizer through the fallback converter matches the native path"
+else bad "shim anonymizer" "$(diff -rq $T/out-s1 $T/out-shim-anon | head -5)"; fi
+
+echo
 echo "======================================================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -eq 0 ] || exit 1
