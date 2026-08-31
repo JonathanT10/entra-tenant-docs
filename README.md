@@ -1,12 +1,13 @@
 # Entra Tenant Docs
 
-Living documentation for your Entra ID tenant. One read-only PowerShell script, three views of the same timestamped snapshot:
+Living documentation for your Entra ID tenant. One read-only PowerShell script, four outputs from the same timestamped snapshot:
 
 | Output | Who it's for |
 |---|---|
-| `docs/` — 8 numbered Markdown files | Admins, auditors, change records. Deterministic output with no timestamps in the section files, so **committing the folder to git turns every re-run into a config-drift diff.** |
+| `docs/` — 9 numbered Markdown files | Admins, auditors, change records. Deterministic output with no timestamps in the section files, so **committing the folder to git turns every re-run into a config-drift diff.** Includes a computed change log. |
 | `tenant.json` | Anything you build on top — the complete structured snapshot. |
-| `report.html` | Everyone else. A self-contained, timestamped report — KPI tiles, license meters, credential-expiry status, Conditional Access at a glance. No server, no dependencies; open it in a browser, drop it on an intranet share. |
+| `report.html` | Everyone else. A self-contained, timestamped report — KPI tiles, trend sparklines, a "what changed" feed, license meters, credential-expiry status, Conditional Access at a glance. No server, no dependencies; open it in a browser, drop it on an intranet share. |
+| `history/` | One JSON snapshot archived per run — the raw material behind trends and the change log. |
 
 ![Report screenshot](screenshot.png)
 
@@ -37,18 +38,23 @@ Re-render offline from a previous snapshot (no connection, byte-identical output
 .\Export-EntraTenantDocs.ps1 -FromJson .\tenant-docs\tenant.json -OutputPath .\rerender
 ```
 
-### The drift-report workflow
+### History, trends, and the change log
+
+Every run archives its snapshot to `history/` (default: under the output folder; `-HistoryPath` moves it, `-NoHistory` skips archiving). From two snapshots onward:
+
+- **Trends** appear in the report — sparklines for members, guests, enforced CA policies, role assignments, app registrations, and credentials in the renewal window, each with its change since the previous snapshot.
+- **What changed** appears in the report and in `docs/08-changelog.md` — the computed diff between snapshots, in English: who got a role, which CA policy flipped state, which dynamic rule was edited, what got bought.
+
+Schedule it weekly and the change log writes itself:
 
 ```powershell
 cd tenant-repo
 Export-EntraTenantDocs.ps1 -OutputPath .
-git add docs tenant.json; git commit -m "Tenant snapshot $(Get-Date -Format yyyy-MM-dd)"
-git diff HEAD~1 -- docs      # exactly what changed in the tenant, in English
+git add docs tenant.json history; git commit -m "Tenant snapshot $(Get-Date -Format yyyy-MM-dd)"
+git diff HEAD~1 -- docs      # the same drift, as a raw diff
 ```
 
-Schedule it weekly and you have a config change log nobody has to remember to write.
-
-## What gets documented (v1: the identity plane)
+## What gets documented (the identity plane)
 
 1. **Tenant** — org info, verified domains, license SKUs (purchased/assigned/available)
 2. **Conditional Access** — every policy rendered readable (users, groups, roles, apps, platforms, locations, client apps, risk, grant and session controls — GUIDs resolved to names), plus named locations
@@ -57,6 +63,7 @@ Schedule it weekly and you have a config change log nobody has to remember to wr
 5. **Authentication methods policy** — which methods are enabled, for whom
 6. **User & guest settings** — the authorization policy in plain English (who can invite guests, who can register apps, guest access level)
 7. **App registrations** — sign-in audience and credential expiry, soonest first
+8. **Change log** — computed by diffing consecutive snapshots: CA policies added/removed/state-changed, role assignments granted/revoked, purchased-license changes, dynamic-rule edits, auth-method toggles, setting flips, app registrations added/removed
 
 ## How this differs from the existing tools
 
@@ -71,11 +78,10 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 - Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
-- v1 documents the identity plane only. Exchange, Intune, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
+- The identity plane only, for now. Exchange, Intune, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
 
 ## Roadmap
 
-- Snapshot history and trends in the HTML report (drift over time, not just current state)
 - Intune: compliance policies and configuration profiles
 - Conditional Access gap analysis (see also the planned CA analyzer)
 - `-Anonymize` switch for sharing output with consultants

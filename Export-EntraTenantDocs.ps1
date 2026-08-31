@@ -26,6 +26,10 @@
       5. Authentication methods policy
       6. User & guest settings (authorization policy) in plain English
       7. App registrations - sign-in audience and credential expiry
+      8. Change log - what changed between snapshots, computed by diffing
+
+    Each run also archives its snapshot to history/ - from two snapshots
+    onward the report gains trend sparklines and a "what changed" feed.
 
     Makes no changes to the tenant. Every call is a read.
 
@@ -43,6 +47,15 @@
 .PARAMETER StaleCredDays
     Days-until-expiry threshold under which an app credential is flagged
     as expiring soon. Default: 90 (30 = "serious" internally).
+
+.PARAMETER HistoryPath
+    Folder where each run archives its snapshot JSON, and where trends and
+    the change log are computed from. Default: <OutputPath>\history
+    (with -SampleData: the bundled sample-history folder).
+
+.PARAMETER NoHistory
+    Do not archive this run's snapshot. Trends and the change log still
+    render from whatever history already exists.
 
 .EXAMPLE
     .\Export-EntraTenantDocs.ps1
@@ -69,7 +82,9 @@ param(
     [string]$OutputPath = '.\tenant-docs',
     [string]$FromJson,
     [switch]$SampleData,
-    [ValidateRange(1, 3650)][int]$StaleCredDays = 90
+    [ValidateRange(1, 3650)][int]$StaleCredDays = 90,
+    [string]$HistoryPath,
+    [switch]$NoHistory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -420,11 +435,195 @@ function Format-StateWord {
 }
 
 # --------------------------------------------------------------------------- #
+# History store, trend series, change detection
+# --------------------------------------------------------------------------- #
+
+function Save-Snapshot {
+    param($Data, [string]$HistoryDir)
+    $null = New-Item -ItemType Directory -Path $HistoryDir -Force
+    $stamp = ([datetime]::Parse($Data.GeneratedUtc).ToUniversalTime()).ToString('yyyyMMdd-HHmmss')
+    $path = Join-Path $HistoryDir "snapshot-$stamp.json"
+    $Data | ConvertTo-Json -Depth 12 | Set-Content -Path $path -Encoding UTF8
+    return $path
+}
+
+function Get-History {
+    # Every archived snapshot plus the current one, deduped by GeneratedUtc,
+    # oldest first. Old snapshots may predate newer fields - readers must
+    # tolerate missing keys.
+    param([string]$HistoryDir, $Current)
+    $snaps = @()
+    if ($HistoryDir -and (Test-Path $HistoryDir)) {
+        foreach ($f in (Get-ChildItem $HistoryDir -Filter '*.json' | Sort-Object Name)) {
+            try {
+                $loaded = Get-Content $f.FullName -Raw | ConvertFrom-Json -AsHashtable
+                Normalize-DataDates $loaded
+                $snaps += , $loaded
+            }
+            catch { Write-Warning "Skipping unreadable history file: $($f.Name)" }
+        }
+    }
+    $seen = @{}; $out = @()
+    foreach ($s in (@($snaps) + @($Current) | Sort-Object { "$($_.GeneratedUtc)" })) {
+        $k = "$($s.GeneratedUtc)"
+        if (-not $seen.ContainsKey($k)) { $seen[$k] = $true; $out += , $s }
+    }
+    return , $out
+}
+
+function Get-TrendSeries {
+    # One metrics row per snapshot, oldest first. Pure function of the data.
+    param($Snapshots, [int]$WarnDays)
+    $rows = @(foreach ($s in $Snapshots) {
+        $ra = 0; $ga = 0
+        foreach ($r in @($s.Roles)) {
+            $n = @($r.Members).Count
+            $ra += $n
+            if ("$($r.Role)" -eq 'Global Administrator') { $ga += $n }
+        }
+        $la = 0; foreach ($l in @($s.Licenses)) { $la += [int]$l.Assigned }
+        [ordered]@{
+            Ts               = "$($s.GeneratedUtc)"
+            Members          = [int]$s.UserCounts.Members
+            EnabledMembers   = [int]$s.UserCounts.EnabledMembers
+            Guests           = [int]$s.UserCounts.Guests
+            CaEnabled        = @(@($s.ConditionalAccess.Policies) | Where-Object { $_.State -eq 'enabled' }).Count
+            CaTotal          = @($s.ConditionalAccess.Policies).Count
+            RoleAssignments  = $ra
+            GlobalAdmins     = $ga
+            Groups           = [int]$s.Groups.Total
+            AppRegistrations = @($s.Applications).Count
+            LicenseAssigned  = $la
+            CredsInWindow    = @(Get-CredRows $s $WarnDays | Where-Object { $_.Severity -ne 'ok' }).Count
+        }
+    })
+    return , $rows
+}
+
+function Get-SnapshotChanges {
+    # Human-readable diff between two consecutive snapshots.
+    param($Prev, $Curr)
+    $L = New-Object System.Collections.Generic.List[object]
+    $ts = "$($Curr.GeneratedUtc)"
+    $add = { param($cat, $kind, $item, $detail)
+        $L.Add([ordered]@{ Ts = $ts; Category = $cat; Kind = $kind; Item = "$item"; Detail = "$detail" })
+    }
+    function _map($rows, $keyExpr) {
+        $m = [ordered]@{}
+        foreach ($r in @($rows)) { if ($null -ne $r) { $m["$(& $keyExpr $r)"] = $r } }
+        return $m
+    }
+
+    # Conditional Access policies (by name)
+    $pp = _map $Prev.ConditionalAccess.Policies { param($x) $x.Name }
+    $cp = _map $Curr.ConditionalAccess.Policies { param($x) $x.Name }
+    foreach ($k in $cp.Keys) {
+        if (-not $pp.Contains($k)) { & $add 'Conditional Access' 'added' $k "state: $(Format-StateWord $cp[$k].State)"; continue }
+        $a = $pp[$k]; $b = $cp[$k]
+        if ("$($a.State)" -ne "$($b.State)") {
+            & $add 'Conditional Access' 'changed' $k "$(Format-StateWord $a.State) -> $(Format-StateWord $b.State)"
+        }
+        elseif (($a | ConvertTo-Json -Depth 8 -Compress) -ne ($b | ConvertTo-Json -Depth 8 -Compress)) {
+            & $add 'Conditional Access' 'changed' $k 'definition changed'
+        }
+    }
+    foreach ($k in $pp.Keys) { if (-not $cp.Contains($k)) { & $add 'Conditional Access' 'removed' $k '' } }
+
+    # Named locations (by name)
+    $pl = _map $Prev.ConditionalAccess.NamedLocations { param($x) $x.Name }
+    $cl = _map $Curr.ConditionalAccess.NamedLocations { param($x) $x.Name }
+    foreach ($k in $cl.Keys) {
+        if (-not $pl.Contains($k)) { & $add 'Named locations' 'added' $k $cl[$k].Detail }
+        elseif ("$($pl[$k].Detail)" -ne "$($cl[$k].Detail)") { & $add 'Named locations' 'changed' $k "$($pl[$k].Detail) -> $($cl[$k].Detail)" }
+    }
+    foreach ($k in $pl.Keys) { if (-not $cl.Contains($k)) { & $add 'Named locations' 'removed' $k '' } }
+
+    # Role assignments (flattened role|principal)
+    function _roleSet($snap) {
+        $set = [ordered]@{}
+        foreach ($r in @($snap.Roles)) {
+            foreach ($m in @($r.Members)) {
+                $who = if ($m.UserPrincipalName) { "$($m.DisplayName) <$($m.UserPrincipalName)>" } else { "$($m.DisplayName) ($($m.Type))" }
+                $set["$($r.Role)|$who"] = @($r.Role, $who)
+            }
+        }
+        return $set
+    }
+    $pr = _roleSet $Prev; $cr = _roleSet $Curr
+    foreach ($k in $cr.Keys) { if (-not $pr.Contains($k)) { & $add 'Role assignments' 'added' $cr[$k][1] $cr[$k][0] } }
+    foreach ($k in $pr.Keys) { if (-not $cr.Contains($k)) { & $add 'Role assignments' 'removed' $pr[$k][1] $pr[$k][0] } }
+
+    # Licenses (purchased counts and SKU add/remove; assigned drift lives in trends)
+    $ps = _map $Prev.Licenses { param($x) $x.Sku }
+    $cs = _map $Curr.Licenses { param($x) $x.Sku }
+    foreach ($k in $cs.Keys) {
+        if (-not $ps.Contains($k)) { & $add 'Licenses' 'added' $k "$($cs[$k].Purchased) purchased" }
+        elseif ([int]$ps[$k].Purchased -ne [int]$cs[$k].Purchased) { & $add 'Licenses' 'changed' $k "purchased $($ps[$k].Purchased) -> $($cs[$k].Purchased)" }
+    }
+    foreach ($k in $ps.Keys) { if (-not $cs.Contains($k)) { & $add 'Licenses' 'removed' $k '' } }
+
+    # Dynamic groups (by name): rule or state changes
+    $pd = _map $Prev.Groups.Dynamic { param($x) $x.Name }
+    $cd = _map $Curr.Groups.Dynamic { param($x) $x.Name }
+    foreach ($k in $cd.Keys) {
+        if (-not $pd.Contains($k)) { & $add 'Dynamic groups' 'added' $k ''; continue }
+        if ("$($pd[$k].Rule)" -ne "$($cd[$k].Rule)") { & $add 'Dynamic groups' 'changed' $k 'membership rule changed' }
+        elseif ("$($pd[$k].State)" -ne "$($cd[$k].State)") { & $add 'Dynamic groups' 'changed' $k "processing $($pd[$k].State) -> $($cd[$k].State)" }
+    }
+    foreach ($k in $pd.Keys) { if (-not $cd.Contains($k)) { & $add 'Dynamic groups' 'removed' $k '' } }
+
+    # Role-assignable groups (name lists)
+    $pra = @($Prev.Groups.RoleAssignable); $cra = @($Curr.Groups.RoleAssignable)
+    foreach ($n in $cra) { if ($n -notin $pra) { & $add 'Role-assignable groups' 'added' $n '' } }
+    foreach ($n in $pra) { if ($n -notin $cra) { & $add 'Role-assignable groups' 'removed' $n '' } }
+
+    # Authentication methods (by method): state changes
+    $pa = _map $Prev.AuthMethods { param($x) $x.Method }
+    $ca = _map $Curr.AuthMethods { param($x) $x.Method }
+    foreach ($k in $ca.Keys) {
+        if ($pa.Contains($k) -and "$($pa[$k].State)" -ne "$($ca[$k].State)") {
+            & $add 'Authentication methods' 'changed' $k "$($pa[$k].State) -> $($ca[$k].State)"
+        }
+    }
+
+    # User & guest settings (by key)
+    function _fmtVal($v) { if ($v -is [bool]) { if ($v) { 'Yes' } else { 'No' } } else { "$v" } }
+    if ($Prev.UserSettings -and $Curr.UserSettings) {
+        foreach ($k in $Curr.UserSettings.Keys) {
+            if ($Prev.UserSettings.Contains($k) -and "$($Prev.UserSettings[$k])" -ne "$($Curr.UserSettings[$k])") {
+                & $add 'User settings' 'changed' $k "$(_fmtVal $Prev.UserSettings[$k]) -> $(_fmtVal $Curr.UserSettings[$k])"
+            }
+        }
+    }
+
+    # App registrations (by AppId)
+    $pApp = _map $Prev.Applications { param($x) $x.AppId }
+    $cApp = _map $Curr.Applications { param($x) $x.AppId }
+    foreach ($k in $cApp.Keys) { if (-not $pApp.Contains($k)) { & $add 'App registrations' 'added' $cApp[$k].Name '' } }
+    foreach ($k in $pApp.Keys) { if (-not $cApp.Contains($k)) { & $add 'App registrations' 'removed' $pApp[$k].Name '' } }
+
+    # Plain return: output enumerates naturally; the caller @()-wraps.
+    # (Do NOT comma-wrap here - @(call) would nest the array one level deep.)
+    return $L.ToArray()
+}
+
+function Get-ChangeLog {
+    # Diff every consecutive snapshot pair; newest changes first.
+    param($Snapshots)
+    $all = New-Object System.Collections.Generic.List[object]
+    for ($i = 1; $i -lt @($Snapshots).Count; $i++) {
+        foreach ($c in @(Get-SnapshotChanges $Snapshots[$i - 1] $Snapshots[$i])) { $all.Add($c) }
+    }
+    $sorted = @($all.ToArray() | Sort-Object { "$($_.Ts)" } -Descending)
+    return , $sorted
+}
+
+# --------------------------------------------------------------------------- #
 # Markdown renderers - deterministic; timestamp appears ONLY in index.md
 # --------------------------------------------------------------------------- #
 
 function Write-Docs {
-    param($Data, [string]$DocsPath, [int]$WarnDays)
+    param($Data, [string]$DocsPath, [int]$WarnDays, $ChangeLog = @(), [int]$SnapCount = 1)
 
     $null = New-Item -ItemType Directory -Path $DocsPath -Force
     $o = $Data.Organization
@@ -451,6 +650,7 @@ function Write-Docs {
     $md.Add("| [5. Authentication methods](05-authentication.md) | $(@($Data.AuthMethods | Where-Object { $_.State -eq 'enabled' }).Count) of $(@($Data.AuthMethods).Count) methods enabled |")
     $md.Add("| [6. User & guest settings](06-user-settings.md) | $(@($Data.UserSettings.Keys).Count) settings documented |")
     $md.Add("| [7. Applications](07-applications.md) | $(@($Data.Applications).Count) registrations, $(@($expiring).Count) credential(s) expiring/expired |")
+    $md.Add("| [8. Change log](08-changelog.md) | $(@($ChangeLog).Count) change(s) across $SnapCount snapshot(s) |")
     $md -join "`n" | Set-Content -Path (Join-Path $DocsPath 'index.md') -Encoding UTF8
 
     # ---- 01-tenant.md ---- #
@@ -638,6 +838,29 @@ function Write-Docs {
         $md.Add("| $(MdEscape $a.Name) | $($a.SignInAudience) | $(@($a.Credentials).Count) | $($a.CreatedUtc) |")
     }
     $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '07-applications.md') -Encoding UTF8
+
+    # ---- 08-changelog.md ---- #
+    # The one section file that carries timestamps by design: it only gains
+    # lines when the tenant actually changed between snapshots.
+    $md = New-Object System.Collections.Generic.List[string]
+    $md.Add('# 8. Change log')
+    $md.Add('')
+    $md.Add("Computed from $SnapCount archived snapshot(s). Only snapshots where something changed appear below, newest first.")
+    if (@($ChangeLog).Count) {
+        foreach ($grp in (@($ChangeLog) | Group-Object { $_.Ts } | Sort-Object Name -Descending)) {
+            $md.Add('')
+            $md.Add("## $($grp.Name)")
+            $md.Add('')
+            foreach ($c in ($grp.Group | Sort-Object { "$($_.Category)|$($_.Kind)|$($_.Item)" })) {
+                $detail = if ($c.Detail) { " - $(MdEscape $c.Detail)" } else { '' }
+                $md.Add("- **$($c.Category)** $($c.Kind): $(MdEscape $c.Item)$detail")
+            }
+        }
+    } else {
+        $md.Add('')
+        $md.Add($(if ($SnapCount -lt 2) { 'History starts here - the change log fills in from the next run onward.' } else { 'No configuration changes detected between snapshots.' }))
+    }
+    $md -join "`n" | Set-Content -Path (Join-Path $DocsPath '08-changelog.md') -Encoding UTF8
 }
 
 # --------------------------------------------------------------------------- #
@@ -731,6 +954,21 @@ ul.plain li { margin: 2px 0; }
 footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
 .who { max-width: 340px; }
 .who .x { color: var(--muted); font-size: 12px; }
+.trend-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.trend { background: var(--page); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.trend .k { font-size: 12px; color: var(--ink-2); }
+.trend .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums;
+  display: flex; align-items: baseline; gap: 8px; }
+.trend .d { font-size: 11.5px; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+.trend svg { display: block; width: 100%; height: 40px; margin-top: 6px; }
+.chg { display: flex; gap: 8px; padding: 5px 0; font-size: 13px; align-items: baseline;
+  border-bottom: 1px solid var(--grid); }
+.chg:last-child { border-bottom: none; }
+.chg .kind { flex: none; width: 76px; font-size: 11.5px; font-weight: 600; color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: .3px; }
+.chg .cat { color: var(--muted); }
+.chg-ts { margin: 12px 0 2px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+[hidden] { display: none !important; }
 @media (max-width: 700px) { .bar-row { grid-template-columns: 1fr 1fr 40px; } }
 </style>
 </head>
@@ -742,6 +980,14 @@ footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
     <div class="stamp">Generated <b id="t-gen"></b> (UTC)</div>
   </header>
   <div class="cards" id="kpis"></div>
+  <section id="trends-section" hidden><h2>Trends</h2>
+    <p class="note" id="trends-note"></p>
+    <div class="trend-grid" id="trends"></div>
+  </section>
+  <section id="changes-section" hidden><h2>What changed</h2>
+    <p class="note" id="changes-note"></p>
+    <div id="changes"></div>
+  </section>
   <section><h2>Conditional Access</h2>
     <p class="note" id="ca-note"></p>
     <div style="overflow-x:auto"><table id="ca-table"></table></div>
@@ -818,6 +1064,68 @@ const kpis = [
 document.getElementById('kpis').innerHTML = kpis.map(x =>
   '<div class="card"><div class="k">' + esc(x.k) + '</div><div class="v">' + esc(x.v) +
   '</div><div class="d">' + esc(x.d) + '</div></div>').join('');
+
+// ---- Trends (small multiples; single series each, direct labels, no legend) ----
+const series = (D.TrendSeries || []);
+if (series.length >= 2) {
+  document.getElementById('trends-section').hidden = false;
+  document.getElementById('trends-note').textContent = series.length + ' snapshots, ' +
+    (series[0].Ts || '').slice(0, 10) + ' \u2192 ' + (series[series.length - 1].Ts || '').slice(0, 10) + '.';
+  const METRICS = [
+    { k: 'Members', label: 'Members' },
+    { k: 'Guests', label: 'Guests' },
+    { k: 'CaEnabled', label: 'CA policies enforced' },
+    { k: 'RoleAssignments', label: 'Role assignments' },
+    { k: 'AppRegistrations', label: 'App registrations' },
+    { k: 'CredsInWindow', label: 'Credentials to renew' }
+  ];
+  function spark(vals) {
+    const w = 220, h = 40, pad = 3;
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const span = max - min;
+    const x = i => pad + i * (w - 2 * pad) / Math.max(1, vals.length - 1);
+    const y = v => span === 0 ? h / 2 : h - pad - (v - min) * (h - 2 * pad) / span;
+    const pts = vals.map((v, i) => x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+    const area = pad + ',' + (h - pad) + ' ' + pts + ' ' + x(vals.length - 1).toFixed(1) + ',' + (h - pad);
+    const lastX = x(vals.length - 1).toFixed(1), lastY = y(vals[vals.length - 1]).toFixed(1);
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" aria-hidden="true">' +
+      '<polygon points="' + area + '" fill="var(--accent)" opacity="0.1"></polygon>' +
+      '<polyline points="' + pts + '" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"></polyline>' +
+      '<circle cx="' + lastX + '" cy="' + lastY + '" r="3" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"></circle></svg>';
+  }
+  document.getElementById('trends').innerHTML = METRICS.map(m => {
+    const vals = series.map(r => Number(r[m.k] || 0));
+    const cur = vals[vals.length - 1], prev = vals[vals.length - 2];
+    const d = cur - prev;
+    const delta = d === 0 ? 'no change' : (d > 0 ? '+' : '') + d + ' since last';
+    return '<div class="trend"><div class="k">' + esc(m.label) + '</div><div class="v">' + esc(cur) +
+      ' <span class="d">' + esc(delta) + '</span></div>' + spark(vals) + '</div>';
+  }).join('');
+}
+
+// ---- What changed ----
+const changes = (D.Changes || []);
+if (changes.length) {
+  document.getElementById('changes-section').hidden = false;
+  const byTs = {};
+  changes.forEach(c => { (byTs[c.Ts] = byTs[c.Ts] || []).push(c); });
+  const tss = Object.keys(byTs).sort().reverse();
+  document.getElementById('changes-note').textContent = changes.length + ' change(s) across ' +
+    tss.length + ' snapshot(s). Full history in docs/08-changelog.md.';
+  const KINDWORD = { added: 'Added', removed: 'Removed', changed: 'Changed' };
+  const CAP = 4;
+  document.getElementById('changes').innerHTML = tss.slice(0, CAP).map(ts =>
+    '<div class="chg-ts">' + esc(ts.replace('T', ' ').replace('Z', ' UTC')) + '</div>' +
+    byTs[ts].map(c =>
+      '<div class="chg"><span class="kind">' + esc(KINDWORD[c.Kind] || c.Kind) + '</span><span>' +
+      esc(c.Item) + (c.Detail ? ' \u2014 ' + esc(c.Detail) : '') +
+      ' <span class="cat">\u00B7 ' + esc(c.Category) + '</span></span></div>'
+    ).join('')
+  ).join('') + (tss.length > CAP ? '<p class="note" style="margin-top:8px">Older changes in docs/08-changelog.md.</p>' : '');
+} else if (series.length >= 2) {
+  document.getElementById('changes-section').hidden = false;
+  document.getElementById('changes-note').textContent = 'No configuration changes detected between snapshots.';
+}
 
 // ---- Conditional Access ----
 function whoSummary(p) {
@@ -956,7 +1264,7 @@ document.getElementById('settings-table').innerHTML = Object.keys(S).length
 '@
 
 function Write-Report {
-    param($Data, [string]$Path, [int]$WarnDays)
+    param($Data, [string]$Path, [int]$WarnDays, $TrendSeries = @(), $ChangeLog = @())
     # The HTML gets the same snapshot plus pre-computed credential rows, so the
     # page needs zero date math and stays consistent with the docs.
     $payload = [ordered]@{}
@@ -965,6 +1273,8 @@ function Write-Report {
         [ordered]@{ App = $_.App; Type = $_.Type; CredName = $_.CredName
                     ExpiresUtc = $_.ExpiresUtc; DaysLeft = $_.DaysLeft; Severity = $_.Severity }
     })
+    $payload['TrendSeries'] = @($TrendSeries)
+    $payload['Changes'] = @(@($ChangeLog) | Select-Object -First 200)
     $json = ($payload | ConvertTo-Json -Depth 12 -Compress) -replace '</', '<\/'
     $HTML_TEMPLATE.Replace('__PAYLOAD__', $json) | Set-Content -Path $Path -Encoding UTF8
 }
@@ -1000,12 +1310,27 @@ $data = if ($FromJson) {
 
 Normalize-DataDates $data
 $null = New-Item -ItemType Directory -Path $OutputPath -Force
-Write-Docs   -Data $data -DocsPath (Join-Path $OutputPath 'docs') -WarnDays $StaleCredDays
+
+$historyDir = if ($HistoryPath) { $HistoryPath }
+              elseif ($SampleData) { Join-Path $PSScriptRoot 'sample-history' }
+              else { Join-Path $OutputPath 'history' }
+if (-not $NoHistory -and -not $FromJson) {
+    $savedTo = Save-Snapshot $data $historyDir
+    Write-Host "Snapshot archived: $savedTo"
+}
+$snaps = Get-History $historyDir $data
+$trend = Get-TrendSeries $snaps $StaleCredDays
+$changeLog = Get-ChangeLog $snaps
+
+Write-Docs   -Data $data -DocsPath (Join-Path $OutputPath 'docs') -WarnDays $StaleCredDays `
+             -ChangeLog $changeLog -SnapCount @($snaps).Count
 $data | ConvertTo-Json -Depth 12 | Set-Content -Path (Join-Path $OutputPath 'tenant.json') -Encoding UTF8
-Write-Report -Data $data -Path (Join-Path $OutputPath 'report.html') -WarnDays $StaleCredDays
+Write-Report -Data $data -Path (Join-Path $OutputPath 'report.html') -WarnDays $StaleCredDays `
+             -TrendSeries $trend -ChangeLog $changeLog
 
 Write-Host ''
 Write-Host "Done. Output in $OutputPath`:"
-Write-Host '  docs/         8 Markdown files (commit these - the git diff is your drift report)'
+Write-Host '  docs/         9 Markdown files (commit these - the git diff is your drift report)'
 Write-Host '  tenant.json   the full snapshot'
 Write-Host '  report.html   the shareable report - open it in a browser'
+Write-Host ("  history       {0} snapshot(s) -> trends + change log" -f @($snaps).Count)
