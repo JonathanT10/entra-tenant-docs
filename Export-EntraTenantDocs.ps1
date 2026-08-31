@@ -1791,6 +1791,7 @@ $newChanges = @(@($changeLog) | Where-Object { "$($_.Ts)" -eq "$($data.Generated
         NonCompliantDevices = $latest.NonCompliantDevices
     }
     NewChanges    = $newChanges
+    CaGaps        = @(Get-CaGapAnalysis $data)
 } | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutputPath 'run-summary.json') -Encoding UTF8
 
 Write-Host ''
