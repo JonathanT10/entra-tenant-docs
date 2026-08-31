@@ -33,6 +33,8 @@ Install-Module Microsoft.Graph.Authentication -Scope CurrentUser   # the only mo
 
 Required scopes (all read-only): `Directory.Read.All`, `Policy.Read.All`, `RoleManagement.Read.Directory`, `Application.Read.All` — plus, for the Intune section, `DeviceManagementConfiguration.Read.All`, `DeviceManagementManagedDevices.Read.All`, `DeviceManagementApps.Read.All` (skip them and the section degrades; `-SkipIntune` skips the attempt entirely). Everything is raw `Invoke-MgGraphRequest` calls — no dependency on the twenty-odd Graph submodules.
 
+Runs in **Windows PowerShell 5.1 and PowerShell 7**. The one 6+-only feature it needs (`ConvertFrom-Json -AsHashtable`) is feature-detected, with a built-in fallback converter for 5.1 — because on a stock corporate Windows box, "right-click → Run with PowerShell" launches 5.1, and a tool for admins that quietly breaks there isn't finished.
+
 Re-render offline from a previous snapshot (no connection, byte-identical output):
 
 ```powershell
@@ -119,7 +121,7 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 ## Honesty notes
 
 - **Read-only.** Every call is a GET (plus one `getByIds` POST that only resolves object IDs to display names). The export changes nothing in the tenant; the alert script is the only component that sends anything anywhere — to *your* webhook and *your* relay.
-- Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
+- Run against one production tenant (2026-08-31): live collection of all eight sections verified against reality. That same run is what caught the PowerShell 5.1 incompatibility this version fixes — the history and `-FromJson` paths failed there, and worse, the history failure was quiet. `-Anonymize` against production data is verified by the same tenant's re-run. Still: dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
 - **`-Anonymize` is not a guarantee.** It replaces the categories listed above, and it deliberately keeps Conditional Access and Intune policy names so the gap analysis stays readable. Those are free text an admin wrote, and free text is where surprises live. Read the output before you share it; don't treat the switch as permission to skip that.
@@ -133,7 +135,7 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 bash tests/run-tests.sh       # needs pwsh, python3, and playwright for the HTML check
 ```
 
-31 checks. The one that matters is the leak scan: it harvests every identifying string from the sample snapshot *and* every history snapshot the run reads, then greps all four output types for them and requires zero hits — plus a positive control that SKUs, role names, policy names and counts are still there, since an anonymizer that redacts everything would otherwise pass. The rest cover determinism under a fixed salt, structural parity against the clear render, coherence of the change log across anonymized history, a mocked live run proving the archive keeps real values while the same run's output does not, graceful degradation on snapshots with no Intune or no roles, and executing `report.html` in a real browser to prove it actually renders — the docs and the report take different code paths, and only running the page catches a payload that is valid JSON and silently broken.
+33 checks. The one that matters is the leak scan: it harvests every identifying string from the sample snapshot *and* every history snapshot the run reads, then greps all four output types for them and requires zero hits — plus a positive control that SKUs, role names, policy names and counts are still there, since an anonymizer that redacts everything would otherwise pass. The rest cover determinism under a fixed salt, structural parity against the clear render, coherence of the change log across anonymized history, a mocked live run proving the archive keeps real values while the same run's output does not, graceful degradation on snapshots with no Intune or no roles, and executing `report.html` in a real browser to prove it actually renders — the docs and the report take different code paths, and only running the page catches a payload that is valid JSON and silently broken. A shim that strips `-AsHashtable` from `ConvertFrom-Json` forces the PowerShell 5.1 fallback path and requires its output to be byte-identical to the native one.
 
 ## Roadmap
 

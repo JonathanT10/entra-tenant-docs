@@ -175,6 +175,45 @@ function Iso {
     catch { return "$v" }
 }
 
+function ConvertTo-OrderedHashtable {
+    # ConvertFrom-Json -AsHashtable needs PowerShell 6+. Everything downstream
+    # treats a snapshot as nested hashtables ($d['Key'], .Contains(), .Keys),
+    # so on Windows PowerShell 5.1 the PSCustomObject graph is converted once,
+    # here, and the rest of the script never knows the difference.
+    param($InputObject)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [string]) { return $InputObject }   # strings enumerate as chars - keep whole
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $h = [ordered]@{}
+        foreach ($p in $InputObject.PSObject.Properties) { $h[$p.Name] = ConvertTo-OrderedHashtable $p.Value }
+        return $h
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $h = [ordered]@{}
+        foreach ($k in @($InputObject.Keys)) { $h[$k] = ConvertTo-OrderedHashtable $InputObject[$k] }
+        return $h
+    }
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $InputObject) { $list.Add((ConvertTo-OrderedHashtable $item)) }
+        # The comma keeps a 0- or 1-element array an ARRAY through the return.
+        # Unrolled, a tenant with exactly one domain or one CA policy would come
+        # back as a scalar and quietly corrupt every consumer downstream.
+        return , $list.ToArray()
+    }
+    return $InputObject
+}
+
+function ConvertFrom-JsonToHashtable {
+    # Feature-detected, not version-checked: the built-in fast path where it
+    # exists, the converter above where it does not (Windows PowerShell 5.1).
+    param([string]$Json)
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('AsHashtable')) {
+        return ($Json | ConvertFrom-Json -AsHashtable)
+    }
+    return (ConvertTo-OrderedHashtable ($Json | ConvertFrom-Json))
+}
+
 # --------------------------------------------------------------------------- #
 # Collection (Graph -> $data). Skipped entirely in -FromJson / -SampleData mode.
 # --------------------------------------------------------------------------- #
@@ -716,14 +755,18 @@ function Get-History {
     # tolerate missing keys.
     param([string]$HistoryDir, $Current)
     $snaps = @()
+    $skipped = 0
     if ($HistoryDir -and (Test-Path $HistoryDir)) {
         foreach ($f in (Get-ChildItem $HistoryDir -Filter '*.json' | Sort-Object Name)) {
             try {
-                $loaded = Get-Content $f.FullName -Raw | ConvertFrom-Json -AsHashtable
+                $loaded = ConvertFrom-JsonToHashtable (Get-Content $f.FullName -Raw)
                 Normalize-DataDates $loaded
                 $snaps += , $loaded
             }
-            catch { Write-Warning "Skipping unreadable history file: $($f.Name)" }
+            catch { $skipped++; Write-Warning "Skipping unreadable history file: $($f.Name) ($($_.Exception.Message))" }
+        }
+        if ($skipped) {
+            Write-Warning ("Get-History: {0} history file(s) could not be read - trends and the change log are missing that much history." -f $skipped)
         }
     }
     $seen = @{}; $out = @()
@@ -2060,9 +2103,9 @@ if ($SampleData) {
 }
 
 $data = if ($FromJson) {
-    if (-not (Test-Path $FromJson)) { exit "Input not found: $FromJson" }
+    if (-not (Test-Path $FromJson)) { throw "Input not found: $FromJson" }
     Write-Host "Rendering from $FromJson (no Graph connection)..."
-    Get-Content $FromJson -Raw | ConvertFrom-Json -AsHashtable
+    ConvertFrom-JsonToHashtable (Get-Content $FromJson -Raw)
 } else {
     Get-TenantData -StaleCredDays $StaleCredDays -SkipIntune:$SkipIntune
 }
