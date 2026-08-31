@@ -218,7 +218,8 @@
         "Kind": "Countries",
         "Detail": "US, CA"
       }
-    ]
+    ],
+    "SecurityDefaults": false
   },
   "Roles": [
     {
