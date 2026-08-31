@@ -130,7 +130,7 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 ## Tests
 
 ```bash
-./tests/run-tests.sh          # needs pwsh, python3, and playwright for the HTML check
+bash tests/run-tests.sh       # needs pwsh, python3, and playwright for the HTML check
 ```
 
 31 checks. The one that matters is the leak scan: it harvests every identifying string from the sample snapshot *and* every history snapshot the run reads, then greps all four output types for them and requires zero hits — plus a positive control that SKUs, role names, policy names and counts are still there, since an anonymizer that redacts everything would otherwise pass. The rest cover determinism under a fixed salt, structural parity against the clear render, coherence of the change log across anonymized history, a mocked live run proving the archive keeps real values while the same run's output does not, graceful degradation on snapshots with no Intune or no roles, and executing `report.html` in a real browser to prove it actually renders — the docs and the report take different code paths, and only running the page catches a payload that is valid JSON and silently broken.
