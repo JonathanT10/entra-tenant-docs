@@ -131,7 +131,7 @@ foreach ($c in ($changes | Select-Object -First $MaxItems)) {
     $lines.Add(("[{0}] {1}: {2}{3}" -f $c.Kind.ToUpper(), $c.Category, $c.Item, $detail))
 }
 if ($changes.Count -gt $MaxItems) {
-    $lines.Add("(+$($changes.Count - $MaxItems) more - see docs/08-changelog.md)")
+    $lines.Add("(+$($changes.Count - $MaxItems) more - see docs/09-changelog.md)")
 }
 if ($expired -gt 0)  { $lines.Add("$expired app credential(s) EXPIRED - see the report's App credentials section.") }
 elseif ($inWindow -gt 0) { $lines.Add("$inWindow app credential(s) inside the renewal window.") }
