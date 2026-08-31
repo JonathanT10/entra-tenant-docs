@@ -20,7 +20,9 @@
 
     What gets documented (identity plane, v1):
       1. Tenant overview - org info, verified domains, license SKUs
-      2. Conditional Access - every policy rendered readable + named locations
+      2. Conditional Access - every policy rendered readable, named
+         locations, and a 10-check gap analysis (MFA coverage, legacy auth,
+         break-glass exclusions, lingering report-only policies, ...)
       3. Directory roles - permanent assignments per role
       4. Groups - counts, role-assignable groups, dynamic membership rules
       5. Authentication methods policy
@@ -283,6 +285,13 @@ function Get-TenantData {
         }
     })
 
+    $securityDefaults = $null
+    try {
+        $sd = Invoke-MgGraphRequest -Method GET -Uri "$G/policies/identitySecurityDefaultsEnforcementPolicy" -OutputType PSObject
+        $securityDefaults = [bool]$sd.isEnabled
+    }
+    catch { Write-Warning "Security defaults state unavailable ($($_.Exception.Message))." }
+
     $namedLocations = @($rawLocations | Sort-Object displayName | ForEach-Object {
         $kind = if ($_.'@odata.type' -match 'ipNamedLocation') { 'IP ranges' }
                 elseif ($_.'@odata.type' -match 'countryNamedLocation') { 'Countries' }
@@ -522,7 +531,7 @@ function Get-TenantData {
         }
         Licenses          = $licenses
         UserCounts        = $userCounts
-        ConditionalAccess = [ordered]@{ Policies = $policies; NamedLocations = $namedLocations }
+        ConditionalAccess = [ordered]@{ Policies = $policies; NamedLocations = $namedLocations; SecurityDefaults = $securityDefaults }
         Roles             = $roles
         Groups            = $groups
         AuthMethods       = $authMethods
@@ -566,6 +575,96 @@ function Format-StateWord {
         'disabled'                            { 'Disabled' }
         default                               { "$State" }
     }
+}
+
+# --------------------------------------------------------------------------- #
+# Conditional Access gap analysis - opinionated baseline hygiene checks,
+# computed purely from the snapshot (works offline and on old snapshots).
+# --------------------------------------------------------------------------- #
+
+function Get-CaGapAnalysis {
+    param($Data)
+    $pols = @($Data.ConditionalAccess.Policies)
+    $enabled = @($pols | Where-Object { "$($_.State)" -eq 'enabled' })
+    $reportOnly = @($pols | Where-Object { "$($_.State)" -eq 'enabledForReportingButNotEnforced' })
+
+    function _allUsers($p)  { @($p.IncludeUsers) -contains 'All' }
+    function _allApps($p)   { @($p.IncludeApps) -contains 'All cloud apps' }
+    function _mfa($p) {
+        (@($p.GrantControls) -contains 'mfa') -or
+        (@(@($p.GrantControls) | Where-Object { "$_" -like 'Authentication strength:*' }).Count -gt 0)
+    }
+    function _block($p)     { @($p.GrantControls) -contains 'block' }
+    function _legacy($p)    { (@($p.ClientAppTypes) -contains 'exchangeActiveSync') -or (@($p.ClientAppTypes) -contains 'other') }
+
+    $checks = New-Object System.Collections.Generic.List[object]
+    $chk = { param($id, $title, $sev, $result, $detail)
+        $checks.Add([ordered]@{ Id = $id; Title = $title; Severity = $sev; Result = $result; Detail = "$detail" })
+    }
+
+    # C1: MFA (or auth strength) required for all users, all apps
+    $c1 = @($enabled | Where-Object { (_allUsers $_) -and (_allApps $_) -and (_mfa $_) })
+    if ($c1.Count) { & $chk 'mfa-all-users' 'MFA required for all users' 'critical' 'pass' "satisfied by '$($c1[0].Name)'" }
+    else { & $chk 'mfa-all-users' 'MFA required for all users' 'critical' 'fail' 'no enabled policy requires MFA for all users on all apps' }
+
+    # C2: legacy authentication blocked
+    $c2 = @($enabled | Where-Object { (_block $_) -and (_legacy $_) })
+    if ($c2.Count) { & $chk 'block-legacy-auth' 'Legacy authentication blocked' 'critical' 'pass' "satisfied by '$($c2[0].Name)'" }
+    else { & $chk 'block-legacy-auth' 'Legacy authentication blocked' 'critical' 'fail' 'no enabled policy blocks legacy client apps (Exchange ActiveSync / other)' }
+
+    # C3: admins covered by MFA (role-targeted, or the all-users policy)
+    $c3role = @($enabled | Where-Object { @($_.IncludeRoles).Count -gt 0 -and (_mfa $_) })
+    if ($c3role.Count) { & $chk 'admin-mfa' 'Admin roles require MFA' 'critical' 'pass' "role-targeted: '$($c3role[0].Name)'" }
+    elseif ($c1.Count) { & $chk 'admin-mfa' 'Admin roles require MFA' 'critical' 'pass' "covered by the all-users policy '$($c1[0].Name)'" }
+    else {
+        $c3ro = @($reportOnly | Where-Object { @($_.IncludeRoles).Count -gt 0 -and (_mfa $_) })
+        $d = if ($c3ro.Count) { "only report-only coverage ('$($c3ro[0].Name)') - not enforced" } else { 'no enabled policy targets directory roles with MFA' }
+        & $chk 'admin-mfa' 'Admin roles require MFA' 'critical' 'fail' $d
+    }
+
+    # C4: some baseline exists at all
+    $sdState = if ($Data.ConditionalAccess.Contains('SecurityDefaults')) { $Data.ConditionalAccess.SecurityDefaults } else { $null }
+    if ($enabled.Count -gt 0) { & $chk 'baseline-exists' 'Conditional Access is enforced' 'critical' 'pass' "$($enabled.Count) enabled policies" }
+    elseif ($sdState -eq $true) { & $chk 'baseline-exists' 'Conditional Access is enforced' 'critical' 'pass' 'no CA policies, but security defaults are on' }
+    elseif ($null -eq $sdState) { & $chk 'baseline-exists' 'Conditional Access is enforced' 'critical' 'unknown' 'no enabled CA policies; security defaults state unknown in this snapshot' }
+    else { & $chk 'baseline-exists' 'Conditional Access is enforced' 'critical' 'fail' 'no enabled CA policies AND security defaults are off' }
+
+    # C5: break-glass exclusions on lockout-capable all-users policies
+    $c5off = @($enabled | Where-Object { (_allUsers $_) -and ((_block $_) -or (_mfa $_)) -and
+        ((@($_.ExcludeUsers).Count + @($_.ExcludeGroups).Count) -eq 0) })
+    if ($c5off.Count) { & $chk 'breakglass-exclusion' 'Break-glass accounts excluded' 'warning' 'fail' "no exclusions on: $((@($c5off | ForEach-Object { $_.Name }) -join ', ')) - lockout risk" }
+    else { & $chk 'breakglass-exclusion' 'Break-glass accounts excluded' 'warning' 'pass' 'every lockout-capable all-users policy has exclusions' }
+
+    # C6: guests covered
+    $c6 = @($enabled | Where-Object { ((_mfa $_) -or (_block $_)) -and
+        ((@($_.IncludeUsers) -contains 'GuestsOrExternalUsers') -or (_allUsers $_)) })
+    if ($c6.Count) { & $chk 'guest-protection' 'Guests covered by MFA or block' 'warning' 'pass' "satisfied by '$($c6[0].Name)'" }
+    else { & $chk 'guest-protection' 'Guests covered by MFA or block' 'warning' 'fail' 'no enabled policy covers guests' }
+
+    # C7: risk-based policies (Entra ID P2)
+    $c7 = @($enabled | Where-Object { @($_.SignInRisk).Count -gt 0 -or @($_.UserRisk).Count -gt 0 })
+    if ($c7.Count) { & $chk 'risk-policies' 'Risk-based policies in use' 'info' 'pass' "satisfied by '$($c7[0].Name)'" }
+    else { & $chk 'risk-policies' 'Risk-based policies in use' 'info' 'fail' 'no enabled policy uses sign-in or user risk (Entra ID P2 feature)' }
+
+    # C8: device-based grant somewhere
+    $c8 = @($enabled | Where-Object { (@($_.GrantControls) -contains 'compliantDevice') -or (@($_.GrantControls) -contains 'domainJoinedDevice') })
+    if ($c8.Count) { & $chk 'device-grants' 'Device compliance used in grants' 'info' 'pass' "satisfied by '$($c8[0].Name)'" }
+    else { & $chk 'device-grants' 'Device compliance used in grants' 'info' 'fail' 'no enabled policy requires a compliant or hybrid-joined device' }
+
+    # C9: report-only policies lingering
+    if ($reportOnly.Count) { & $chk 'report-only-lingering' 'No lingering report-only policies' 'warning' 'fail' "report-only: $((@($reportOnly | ForEach-Object { $_.Name }) -join ', ')) - enforce or remove" }
+    else { & $chk 'report-only-lingering' 'No lingering report-only policies' 'warning' 'pass' '' }
+
+    # C10: named locations all referenced
+    $usedLoc = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($p in $pols) {
+        foreach ($n in @($p.Locations.Include) + @($p.Locations.Exclude)) { if ($n) { [void]$usedLoc.Add("$n") } }
+    }
+    $unused = @(@($Data.ConditionalAccess.NamedLocations) | Where-Object { -not $usedLoc.Contains("$($_.Name)") } | ForEach-Object { $_.Name })
+    if ($unused.Count) { & $chk 'unused-locations' 'Named locations all referenced' 'info' 'fail' "unused: $($unused -join ', ')" }
+    else { & $chk 'unused-locations' 'Named locations all referenced' 'info' 'pass' '' }
+
+    return $checks.ToArray()
 }
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +728,7 @@ function Get-TrendSeries {
             AppRegistrations = @($s.Applications).Count
             LicenseAssigned  = $la
             CredsInWindow    = @(Get-CredRows $s $WarnDays | Where-Object { $_.Severity -ne 'ok' }).Count
+            CaGapsCritical   = @(Get-CaGapAnalysis $s | Where-Object { $_.Result -eq 'fail' -and $_.Severity -eq 'critical' }).Count
             EnrolledDevices  = if ($s.Intune -and $s.Intune.Available) { [int]$s.Intune.Devices.Total } else { $null }
             NonCompliantDevices = if ($s.Intune -and $s.Intune.Available) { [int]$s.Intune.ComplianceSummary.NonCompliant } else { $null }
         }
@@ -760,6 +860,21 @@ function Get-SnapshotChanges {
         foreach ($k in $pm.Keys) { if (-not $cm.Contains($k)) { & $add 'App protection' 'removed' $k '' } }
     }
 
+    # CA gap transitions (derived posture drift - opens and closes alert-worthy)
+    $pg = _map (Get-CaGapAnalysis $Prev) { param($x) $x.Id }
+    $cg = _map (Get-CaGapAnalysis $Curr) { param($x) $x.Id }
+    foreach ($k in $cg.Keys) {
+        if (-not $pg.Contains($k)) { continue }
+        $a = $pg[$k]; $b = $cg[$k]
+        if ("$($a.Result)" -eq 'unknown' -or "$($b.Result)" -eq 'unknown') { continue }
+        if ("$($a.Result)" -eq 'pass' -and "$($b.Result)" -eq 'fail') {
+            & $add 'CA gap' 'added' $b.Title "now failing ($($b.Severity)): $($b.Detail)"
+        }
+        elseif ("$($a.Result)" -eq 'fail' -and "$($b.Result)" -eq 'pass') {
+            & $add 'CA gap' 'removed' $b.Title 'resolved'
+        }
+    }
+
     # App registrations (by AppId)
     $pApp = _map $Prev.Applications { param($x) $x.AppId }
     $cApp = _map $Curr.Applications { param($x) $x.AppId }
@@ -808,7 +923,9 @@ function Write-Docs {
     $md.Add('| Section | At a glance |')
     $md.Add('|---|---|')
     $md.Add("| [1. Tenant](01-tenant.md) | $(@($o.Domains).Count) domain(s), $(@($Data.Licenses).Count) license SKU(s), $($Data.UserCounts.Members) members + $($Data.UserCounts.Guests) guests |")
-    $md.Add("| [2. Conditional Access](02-conditional-access.md) | $caEnabled enabled, $caReport report-only, $caOff disabled |")
+    $gaps = @(Get-CaGapAnalysis $Data | Where-Object { $_.Result -eq 'fail' })
+    $gapsCrit = @($gaps | Where-Object { $_.Severity -eq 'critical' }).Count
+    $md.Add("| [2. Conditional Access](02-conditional-access.md) | $caEnabled enabled, $caReport report-only, $caOff disabled; $(@($gaps).Count) gap(s), $gapsCrit critical |")
     $md.Add("| [3. Directory roles](03-roles.md) | $(@($Data.Roles).Count) role(s) with assignments |")
     $md.Add("| [4. Groups](04-groups.md) | $($Data.Groups.Total) total, $(@($Data.Groups.Dynamic).Count) dynamic |")
     $md.Add("| [5. Authentication methods](05-authentication.md) | $(@($Data.AuthMethods | Where-Object { $_.State -eq 'enabled' }).Count) of $(@($Data.AuthMethods).Count) methods enabled |")
@@ -855,6 +972,21 @@ function Write-Docs {
     $md.Add('# 2. Conditional Access')
     $md.Add('')
     $md.Add("$caEnabled enabled | $caReport report-only | $caOff disabled")
+    $md.Add('')
+    $md.Add('## Gap analysis')
+    $md.Add('')
+    $md.Add('Opinionated baseline hygiene checks, not a compliance audit.')
+    $md.Add('')
+    $md.Add('| Check | Result | Detail |')
+    $md.Add('|---|---|---|')
+    foreach ($c in @(Get-CaGapAnalysis $Data)) {
+        $r = switch ("$($c.Result)") {
+            'pass'    { 'PASS' }
+            'fail'    { "GAP ($($c.Severity))" }
+            default   { 'UNKNOWN' }
+        }
+        $md.Add("| $(MdEscape $c.Title) | $r | $(MdEscape $c.Detail) |")
+    }
     foreach ($p in @($Data.ConditionalAccess.Policies)) {
         $md.Add('')
         $md.Add("## $(MdEscape $p.Name)")
@@ -1216,6 +1348,7 @@ footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
   </section>
   <section><h2>Conditional Access</h2>
     <p class="note" id="ca-note"></p>
+    <div id="ca-gaps" style="margin-bottom:12px"></div>
     <div style="overflow-x:auto"><table id="ca-table"></table></div>
     <div id="ca-locations"></div>
   </section>
@@ -1311,7 +1444,8 @@ if (series.length >= 2) {
     { k: 'AppRegistrations', label: 'App registrations' },
     { k: 'CredsInWindow', label: 'Credentials to renew' },
     { k: 'EnrolledDevices', label: 'Enrolled devices' },
-    { k: 'NonCompliantDevices', label: 'Non-compliant devices' }
+    { k: 'NonCompliantDevices', label: 'Non-compliant devices' },
+    { k: 'CaGapsCritical', label: 'Critical CA gaps' }
   ];
   function spark(vals) {
     const w = 220, h = 40, pad = 3;
@@ -1403,6 +1537,27 @@ document.getElementById('ca-table').innerHTML =
     return '<tr><td>' + esc(p.Name) + '</td><td>' + st + '</td><td>' + whoSummary(p) +
       '</td><td>' + esc(apps) + '</td><td>' + grantSummary(p) + '</td></tr>';
   }).join('');
+const gaps = (D.CaGaps || []);
+if (gaps.length) {
+  const SEVCOLOR = { critical: 'critical', warning: 'warning', info: 'muted' };
+  const failing = gaps.filter(c => c.Result === 'fail');
+  const passing = gaps.filter(c => c.Result !== 'fail');
+  const row = c => {
+    let b;
+    if (c.Result === 'pass') b = badge('good', 'check', 'Pass');
+    else if (c.Result === 'unknown') b = '<span class="badge muted">' + ICONS.dash + 'Unknown</span>';
+    else if (c.Severity === 'info') b = '<span class="badge muted">' + ICONS.dash + 'Gap</span>';
+    else b = badge(SEVCOLOR[c.Severity] || 'warning', 'warn', 'Gap \u00B7 ' + c.Severity);
+    return '<div class="chg"><span style="flex:none;width:132px">' + b + '</span><span>' +
+      esc(c.Title) + (c.Detail ? ' <span class="muted">\u2014 ' + esc(c.Detail) + '</span>' : '') + '</span></div>';
+  };
+  document.getElementById('ca-gaps').innerHTML =
+    '<div style="font-size:13px;font-weight:600;margin-bottom:2px">Gap analysis <span class="muted" style="font-weight:400">\u00B7 baseline hygiene, not a compliance audit</span></div>' +
+    failing.map(row).join('') +
+    (passing.length ? '<details><summary>' + passing.length + ' passing / not applicable</summary>' +
+      passing.map(row).join('') + '</details>' : '');
+}
+
 const locs = (D.ConditionalAccess.NamedLocations || []);
 if (locs.length) {
   document.getElementById('ca-locations').innerHTML =
@@ -1556,6 +1711,7 @@ function Write-Report {
     })
     $payload['TrendSeries'] = @($TrendSeries)
     $payload['Changes'] = @(@($ChangeLog) | Select-Object -First 200)
+    $payload['CaGaps'] = @(Get-CaGapAnalysis $Data)
     $json = ($payload | ConvertTo-Json -Depth 12 -Compress) -replace '</', '<\/'
     $HTML_TEMPLATE.Replace('__PAYLOAD__', $json) | Set-Content -Path $Path -Encoding UTF8
 }
@@ -1629,6 +1785,8 @@ $newChanges = @(@($changeLog) | Where-Object { "$($_.Ts)" -eq "$($data.Generated
         AppRegistrations = $latest.AppRegistrations
         CredsInWindow    = $latest.CredsInWindow
         CredsExpired     = @($credRowsNow | Where-Object { $_.Severity -eq 'expired' }).Count
+        CaGapsCritical   = $latest.CaGapsCritical
+        CaGapsWarning    = @(Get-CaGapAnalysis $data | Where-Object { $_.Result -eq 'fail' -and $_.Severity -eq 'warning' }).Count
         EnrolledDevices  = $latest.EnrolledDevices
         NonCompliantDevices = $latest.NonCompliantDevices
     }

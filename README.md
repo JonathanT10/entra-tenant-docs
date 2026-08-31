@@ -79,7 +79,7 @@ One thing interactive runs hide: a scheduled task can't answer a sign-in prompt.
 ## What gets documented
 
 1. **Tenant** — org info, verified domains, license SKUs (purchased/assigned/available)
-2. **Conditional Access** — every policy rendered readable (users, groups, roles, apps, platforms, locations, client apps, risk, grant and session controls — GUIDs resolved to names), plus named locations
+2. **Conditional Access** — every policy rendered readable (users, groups, roles, apps, platforms, locations, client apps, risk, grant and session controls — GUIDs resolved to names), named locations, and a **10-check gap analysis**: MFA for all users, legacy auth blocked, admin MFA coverage, CA-vs-security-defaults, break-glass exclusions, guest coverage, risk-based policies, device-based grants, lingering report-only policies, unused named locations. Gap open/close transitions land in the change log — so a posture regression fires the Teams alert
 3. **Directory roles** — permanent assignments per role
 4. **Groups** — counts by type, role-assignable groups, every dynamic membership rule verbatim
 5. **Authentication methods policy** — which methods are enabled, for whom
@@ -101,13 +101,13 @@ If you need backup/restore or config enforcement, use those. If you need *curren
 - Tested for syntax and structure against mocked Graph data; **not yet run against a production tenant** — dev tenant first, as with anything that touches Graph.
 - **PIM eligible assignments are not included** — the roles section reads permanent assignments only. Group-based role assignments are listed as the group, not expanded to members.
 - Secret *values* never appear anywhere — Graph doesn't return them; only credential names and expiry dates are documented.
+- The CA gap checks are **opinionated baseline hygiene, not a compliance audit** — they encode common guidance (require MFA broadly, block legacy auth, keep break-glass exclusions), and a well-run tenant can still have legitimate reasons to differ.
 - Coverage is the identity plane plus Intune's v1.0 surface. Exchange, SharePoint, and Teams settings live behind different APIs and are on the roadmap, not in the script.
 - **Settings catalog policies are not documented** — that Intune API is still beta-only in Microsoft Graph, and this tool sticks to v1.0. The classic compliance policies and configuration profiles are covered.
 
 ## Roadmap
 
 - Intune settings catalog policies (when the API reaches Graph v1.0)
-- Conditional Access gap analysis (see also the planned CA analyzer)
 - `-Anonymize` switch for sharing output with consultants
 
 ## Related tools
