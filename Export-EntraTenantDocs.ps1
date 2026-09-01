@@ -80,13 +80,25 @@
     built-in role names, policy states, grant and session controls, platforms,
     client app types, Intune types and setting keys, and dates.
 
-    ALSO KEPT, and worth knowing before you share: Conditional Access and
-    Intune POLICY NAMES are left as written, so the gap analysis stays
-    readable. Those are admin-authored free text and can name a vendor, a
-    person, or a service account. Read them before handing the output over.
+    ALSO KEPT, with one safeguard: Conditional Access and Intune POLICY
+    NAMES are left as written so the gap analysis stays readable - BUT any
+    name the anonymizer already replaced elsewhere (a person, group, app,
+    named location, domain, or the organization itself) is substituted
+    inside them too. "CA - Restrict relay to HQ Offices" becomes
+    "CA - Restrict relay to Location a1b2c3". Names shorter than 4
+    characters are left alone so an app called "IT" cannot mangle every
+    policy name containing those letters. Policy names are still
+    admin-authored free text - read them before handing the output over,
+    or use -AnonymizePolicyNames to pseudonymize them entirely.
 
     The history archived on disk is NOT anonymized - only the rendered output
     is - so your own drift history stays intact and readable.
+
+.PARAMETER AnonymizePolicyNames
+    With -Anonymize: replace Conditional Access and Intune policy names
+    entirely with pseudonyms instead of keeping them (scrubbed). Use when
+    the output goes somewhere you do not control - the gap analysis will
+    read "satisfied by 'Policy 2c9f'", which is the price.
 
 .PARAMETER AnonymizeSalt
     Fixes the anonymization salt so the same real value maps to the same
@@ -127,7 +139,8 @@ param(
     [switch]$NoHistory,
     [switch]$SkipIntune,
     [switch]$Anonymize,
-    [string]$AnonymizeSalt
+    [string]$AnonymizeSalt,
+    [switch]$AnonymizePolicyNames
 )
 
 $ErrorActionPreference = 'Stop'
@@ -994,7 +1007,11 @@ function Write-Docs {
     $md.Add('Snapshot produced by [entra-tenant-docs](https://github.com/JonathanT10/entra-tenant-docs). Section files carry no timestamps, so a git diff of this folder is a config-drift report.')
     $md.Add('')
     if ($Data.Contains('Anonymized') -and $Data['Anonymized']) {
-        $md.Add('> **Anonymized.** People, groups, domains, app names and tenant ids below are pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune **policy names are real** - they are admin-authored text, so check them before sharing this.')
+        if ($Data.Contains('PolicyNamesPseudonymized') -and $Data['PolicyNamesPseudonymized']) {
+            $md.Add('> **Anonymized.** People, groups, domains, app names, tenant ids AND policy names below are pseudonyms, not real values. Counts, dates and settings are real.')
+        } else {
+            $md.Add('> **Anonymized.** People, groups, domains, app names and tenant ids below are pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune **policy names are kept as written**, except that names already replaced elsewhere were substituted inside them too - they are still admin-authored text, so check them before sharing this.')
+        }
         $md.Add('')
     }
     $md.Add('| Section | At a glance |')
@@ -1494,9 +1511,13 @@ document.getElementById('t-gen').textContent = (D.GeneratedUtc || '').replace('T
 if (D.Anonymized) {
   const a = document.getElementById('t-anon');
   a.hidden = false;
-  a.innerHTML = '<b>Anonymized.</b> People, groups, domains, app names and tenant ids on this page are ' +
-    'pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune ' +
-    '<b>policy names are real</b> &mdash; they are admin-authored text, so check them before sharing this.';
+  a.innerHTML = D.PolicyNamesPseudonymized
+    ? '<b>Anonymized.</b> People, groups, domains, app names, tenant ids <b>and policy names</b> on this ' +
+      'page are pseudonyms, not real values. Counts, dates and settings are real.'
+    : '<b>Anonymized.</b> People, groups, domains, app names and tenant ids on this page are ' +
+      'pseudonyms, not real values. Counts, dates and settings are real. Conditional Access and Intune ' +
+      '<b>policy names are kept as written</b>, except that names already replaced elsewhere were ' +
+      'substituted inside them too &mdash; still admin-authored text, so check them before sharing this.';
 }
 
 // ---- credential rows (same thresholds as the docs: computed server-side severity) ----
@@ -1842,6 +1863,7 @@ function Initialize-Anonymizer {
     $script:AnonTaken = @{}
     $script:AnonDomain = 'example.com'
     $script:AnonDomainLocked = $false
+    $script:AnonScrubList = $null
 }
 
 function Get-AnonTag {
@@ -2094,6 +2116,66 @@ function Protect-TenantData {
     $Data['Anonymized'] = $true
 }
 
+function Get-KeptNameScrubList {
+    # Every real value the anonymizer has already replaced, paired with its
+    # pseudonym - the substitution list for names we otherwise keep. Longest
+    # first, so "HQ Offices West" is replaced before "HQ Offices" can eat it.
+    # Reals under 4 characters are skipped: an app named "IT" must not mangle
+    # every policy name containing those two letters.
+    if ($null -ne $script:AnonScrubList) { return $script:AnonScrubList }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($k in @($script:AnonMap.Keys)) {
+        $i = $k.IndexOf('|')
+        $kind = $k.Substring(0, $i)
+        $real = $k.Substring($i + 1)
+        if ($kind -in @('Person', 'Group', 'App', 'Location', 'Service', 'Domain', 'Org') -and $real.Length -ge 4) {
+            $rows.Add(@($real, $script:AnonMap[$k]))
+        }
+    }
+    $script:AnonScrubList = @($rows.ToArray() | Sort-Object { - "$($_[0])".Length })
+    return $script:AnonScrubList
+}
+
+function Get-ScrubbedKeptName {
+    param($Name)
+    if ($null -eq $Name -or "$Name" -eq '') { return $Name }
+    $s = "$Name"
+    foreach ($pair in @(Get-KeptNameScrubList)) {
+        $pattern = '(?<![A-Za-z0-9])' + [regex]::Escape("$($pair[0])") + '(?![A-Za-z0-9])'
+        $replacement = "$($pair[1])".Replace('$', '$$')
+        $s = [regex]::Replace($s, $pattern, $replacement, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+    # and anything address-shaped that never went through the mapping
+    return Get-AnonScrubbedString $s
+}
+
+function Protect-KeptNames {
+    <# Second pass, run only after EVERY snapshot has been through
+       Protect-TenantData: the mapping table is complete by then, so a group
+       first seen in an old snapshot still scrubs out of a new policy name -
+       and the change log's policy-name keys stay identical across the series.
+       In-place and guarded, like Protect-TenantData. #>
+    param($Data, [switch]$Full)
+    if (-not $Data) { return }
+    if ($Data.Contains('AnonymizedNames') -and $Data['AnonymizedNames']) { return }
+    $ca = $Data['ConditionalAccess']
+    if ($ca) {
+        foreach ($p in @($ca['Policies'])) {
+            $p['Name'] = if ($Full) { Get-Pseudonym 'Policy' $p['Name'] } else { Get-ScrubbedKeptName $p['Name'] }
+        }
+    }
+    $i = $Data['Intune']
+    if ($i -and $i['Available']) {
+        foreach ($key in @('CompliancePolicies', 'ConfigurationProfiles', 'AppProtection')) {
+            foreach ($p in @($i[$key])) {
+                $p['Name'] = if ($Full) { Get-Pseudonym 'Policy' $p['Name'] } else { Get-ScrubbedKeptName $p['Name'] }
+            }
+        }
+    }
+    $Data['PolicyNamesPseudonymized'] = [bool]$Full
+    $Data['AnonymizedNames'] = $true
+}
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -2129,8 +2211,16 @@ if ($Anonymize) {
     Initialize-Anonymizer -Salt $AnonymizeSalt
     Protect-TenantData $data
     foreach ($s in @($snaps)) { Protect-TenantData $s }
+    # Names pass runs only after the whole series is mapped - see Protect-KeptNames.
+    Protect-KeptNames $data -Full:$AnonymizePolicyNames
+    foreach ($s in @($snaps)) { Protect-KeptNames $s -Full:$AnonymizePolicyNames }
     Write-Host 'Anonymized: identities, groups, domains and app names replaced with pseudonyms.'
-    Write-Host '  Policy names are KEPT so the gap analysis stays readable - read them before sharing.'
+    if ($AnonymizePolicyNames) {
+        Write-Host '  Policy names pseudonymized too (-AnonymizePolicyNames).'
+    } else {
+        Write-Host '  Policy names are KEPT for readability; known directory names inside them were substituted.'
+        Write-Host '  They are still free text an admin wrote - read them before sharing.'
+    }
 }
 
 $trend = Get-TrendSeries $snaps $StaleCredDays
