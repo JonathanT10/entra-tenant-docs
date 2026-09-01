@@ -25,6 +25,14 @@ KEEP_ASSIGNMENTS = {"All devices", "All users"}
 MIN_LEN = 4
 
 
+def token_in(value, text):
+    """Whole-token, case-insensitive: the scrub replaces case-insensitively,
+    so the scanner must look the same way - and a short value like 'main'
+    inside 'domain' must not count."""
+    pat = r'(?<![A-Za-z0-9])' + re.escape(value) + r'(?![A-Za-z0-9])'
+    return re.search(pat, text, re.IGNORECASE) is not None
+
+
 def add(bag, value, why, allow=frozenset()):
     if value is None:
         return
@@ -90,7 +98,7 @@ def harvest(d, bag):
                     add(bag, asg, "Intune assignment", KEEP_ASSIGNMENTS)
 
 
-def survivors(d):
+def survivors(d, bag=None):
     """Values that MUST still appear - proof it did not just redact everything."""
     out = {}
     for l in d.get("Licenses") or []:
@@ -101,7 +109,13 @@ def survivors(d):
             out.setdefault(str(r["Role"]), set()).add("built-in role name")
     for p in (d.get("ConditionalAccess") or {}).get("Policies") or []:
         if p.get("Name"):
-            out.setdefault(str(p["Name"]), set()).add("CA policy name (kept by design)")
+            name = str(p["Name"])
+            # A policy name that embeds a mapped identifier is deliberately
+            # rewritten by the scrub, so verbatim survival is only expected
+            # of names that embed none.
+            if bag is not None and any(token_in(v, name) for v in bag):
+                continue
+            out.setdefault(name, set()).add("CA policy name (kept by design)")
     uc = d.get("UserCounts") or {}
     for k, v in uc.items():
         out.setdefault(str(v), set()).add("user count " + k)
@@ -142,9 +156,7 @@ def main():
     # Whole-token match: a short credential name like "main" is a real
     # identifier worth scanning for, but a substring test would flag the word
     # "domain" and bury a real leak in noise.
-    def hit(value, text):
-        pat = r'(?<![A-Za-z0-9])' + re.escape(value) + r'(?![A-Za-z0-9])'
-        return re.search(pat, text) is not None
+    hit = token_in
 
     leaks = []
     for value, whys in sorted(bag.items()):
@@ -152,7 +164,7 @@ def main():
             if hit(value, text):
                 leaks.append((value, sorted(whys), name))
 
-    keep = survivors(current)
+    keep = survivors(current, bag)
     missing = []
     for value, whys in sorted(keep.items()):
         if not any(hit(value, t) for t in files.values()):

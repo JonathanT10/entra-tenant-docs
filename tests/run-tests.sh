@@ -171,6 +171,39 @@ if diff -r $T/out-s1 $T/out-shim-anon >/dev/null 2>&1; then
 else bad "shim anonymizer" "$(diff -rq $T/out-s1 $T/out-shim-anon | head -5)"; fi
 
 echo
+echo "--- 11. kept policy names get known identifiers scrubbed -------------"
+python3 - <<'PY2'
+import json, os
+d = json.load(open(os.environ['REPO'] + "/sample-data.json"))
+# embed a mapped location, group and an email into admin-authored names
+d['ConditionalAccess']['Policies'][0]['Name'] = "Block legacy auth except HQ egress for Helpdesk Team (owner hank@northwindtraders.com)"
+d['Intune']['CompliancePolicies'][0]['Name'] = "Windows compliance baseline - Sales - Dynamic ring"
+json.dump(d, open(os.environ['T'] + '/embed.json', 'w'))
+PY2
+rm -rf $T/out-scrub $T/out-fullnames
+$PWSH -NoProfile -File $SCRIPT -FromJson $T/embed.json -Anonymize -NoHistory -OutputPath $T/out-scrub >/dev/null 2>&1 \
+  || bad "scrub render" "render failed"
+CA=$T/out-scrub/docs/02-conditional-access.md
+if grep -qE "HQ egress|Helpdesk Team|northwindtraders|Sales - Dynamic" $CA $T/out-scrub/tenant.json $T/out-scrub/docs/08-intune.md; then
+  bad "scrub: embedded identifiers removed from kept names" "$(grep -hoE 'HQ egress|Helpdesk Team|northwindtraders|Sales - Dynamic' $CA $T/out-scrub/tenant.json $T/out-scrub/docs/08-intune.md | sort -u)"
+else ok "scrub: location, group, email and dynamic-group names gone from kept policy names"; fi
+if grep -q "Block legacy auth except Location " $CA && grep -q "for Group " $CA; then
+  ok "scrub: the name's shape survives - words kept, identifiers pseudonymized"
+else bad "scrub shape" "$(grep 'Block legacy auth except' $CA | head -1)"; fi
+if grep -q "Windows compliance baseline - Group .* ring" $T/out-scrub/docs/08-intune.md; then
+  ok "scrub: Intune policy names get the same treatment"
+else bad "scrub intune" "$(grep 'compliance baseline' $T/out-scrub/docs/08-intune.md | head -1)"; fi
+
+$PWSH -NoProfile -File $SCRIPT -FromJson $T/embed.json -Anonymize -AnonymizePolicyNames -NoHistory -OutputPath $T/out-fullnames >/dev/null 2>&1 \
+  || bad "full-names render" "render failed"
+if grep -qE "Block legacy auth|Require MFA for all users" $T/out-fullnames/docs/02-conditional-access.md; then
+  bad "-AnonymizePolicyNames" "original policy wording still present"
+else ok "-AnonymizePolicyNames replaces policy names entirely"; fi
+# (no leakscan here: the fixture deliberately renames a sample policy, so the
+#  sample-derived survivors list cannot apply to this render; section 1 covers
+#  the scanner against the true sample.)
+
+echo
 echo "======================================================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -eq 0 ] || exit 1
