@@ -231,6 +231,23 @@ function ConvertFrom-JsonToHashtable {
 # Collection (Graph -> $data). Skipped entirely in -FromJson / -SampleData mode.
 # --------------------------------------------------------------------------- #
 
+function Test-GraphScope {
+    <# True when the sign-in already carries every scope named.
+
+       This is asked BEFORE a section is collected, not after it fails. Calling
+       an endpoint the token was never granted makes the Graph SDK try to get
+       the scope on the spot - which opens a browser window in the middle of a
+       collection, behind whatever window you are looking at. A refresh nobody
+       can see waiting is a refresh that looks like it has hung. #>
+    param([string[]]$Scopes)
+    $ctx = Get-MgContext
+    if (-not $ctx) { return $false }
+    $have = @($ctx.Scopes)
+    if (-not $have.Count) { return $false }
+    foreach ($s in $Scopes) { if ($s -notin $have) { return $false } }
+    return $true
+}
+
 function Get-TenantData {
     param([int]$StaleCredDays, [switch]$SkipIntune)
 
@@ -485,6 +502,14 @@ function Get-TenantData {
 
     # -- 8. Intune (v1.0 endpoints only; degrades when absent) ----------------- #
     $intune = [ordered]@{ Available = $false }
+    $intuneScopes = @('DeviceManagementConfiguration.Read.All',
+                      'DeviceManagementManagedDevices.Read.All',
+                      'DeviceManagementApps.Read.All')
+    if (-not $SkipIntune -and -not (Test-GraphScope $intuneScopes)) {
+        Write-Host 'Intune: this sign-in was not granted the Intune permissions, so that section is skipped.'
+        $intune['Reason'] = 'this sign-in was not granted the Intune permissions'
+        $SkipIntune = $true
+    }
     if (-not $SkipIntune) {
         Write-Host 'Collecting Intune (skipped automatically if not licensed)...'
         try {
