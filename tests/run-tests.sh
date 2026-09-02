@@ -204,6 +204,17 @@ else ok "-AnonymizePolicyNames replaces policy names entirely"; fi
 #  the scanner against the true sample.)
 
 echo
+echo "--- 12. a section the sign-in cannot reach is skipped, not attempted ---"
+# Calling an endpoint you were never granted makes the Graph SDK open a browser
+# window mid-collection, behind whatever you are looking at. That is what a
+# refresh that "hangs" turned out to be.
+if $PWSH -NoProfile -File $HERE/test-intune-scope.ps1 > $T/intune.txt 2>&1; then
+  while read -r line; do ok "${line#PASS }"; done < <(grep '^PASS' $T/intune.txt)
+else
+  bad "intune scope gate" "$(grep -E '^FAIL|RESULT' $T/intune.txt | head -5)"
+fi
+
+echo
 echo "======================================================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -eq 0 ] || exit 1
